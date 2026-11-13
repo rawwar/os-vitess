@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 11 · Topology Service</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="11" data-title="Topology Service" data-part="Part III — vtgate: The Query Router" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part III · Chapter 16</div>
+      <h1>The filing cabinet.</h1>
+      <p class="subtitle">The <span class="g" data-term="topo">topo service</span> stores everything Vitess processes need to coordinate: which shards exist, which tablet is primary, what the sharding key is. Everyone reads it; only the control plane writes it.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>List the things stored in topo (keyspaces, shards, tablets, vschema, locks).</li>
+          <li>Explain the global vs. cell-local split.</li>
+          <li>Use <code>vtctldclient</code> to read topo state from your local cluster.</li>
+          <li>Find the <code>Conn</code> interface in <code>go/vt/topo/conn.go</code> and recognize it as a versioned KV store.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>What lives in the topo</h2>
+      <ul>
+        <li><strong>Cells</strong> — list of cells &amp; how to reach their topo</li>
+        <li><strong>Keyspaces</strong> — logical databases; their sharding config</li>
+        <li><strong>Shards</strong> — slices of a keyspace by key range</li>
+        <li><strong>Tablets</strong> — each vttablet's record (host, port, type, etc.)</li>
+        <li><strong>VSchema</strong> — sharding rules (vindexes, tables → vindexes)</li>
+        <li><strong>SrvKeyspace</strong> — per-cell <em>serving</em> view of a keyspace (what vtgate uses)</li>
+        <li><strong>Routing rules</strong> — workflow-time hints for MoveTables</li>
+        <li><strong>Locks</strong> — coordinate destructive operations</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Global vs cell-local</h2>
+      <div class="mermaid">
+flowchart LR
+    Global[(global topo<br/>keyspaces, vschema, locks)]
+    Cell1[(cell us-east<br/>tablets, SrvKeyspace)]
+    Cell2[(cell us-west<br/>tablets, SrvKeyspace)]
+    Global -.references.-> Cell1
+    Global -.references.-> Cell2
+      </div>
+      <ul>
+        <li>The <strong>global</strong> topo holds the cluster-wide schema (keyspaces, vschema, locks).</li>
+        <li>Each <strong>cell</strong> has its own topo holding the tablets/serving data for that DC.</li>
+        <li>vtgate reads its cell's topo for serving; vtctld coordinates via global.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The pluggable interface</h2>
+      <pre><code class="language-go">// in go/vt/topo/conn.go (abridged)
+type Conn interface {
+    Create(ctx context.Context, filePath string, contents []byte) (Version, error)
+    Update(ctx context.Context, filePath string, contents []byte, version Version) (Version, error)
+    Get(ctx context.Context, filePath string) ([]byte, Version, error)
+    Delete(ctx context.Context, filePath string, version Version) error
+    List(ctx context.Context, filePathPrefix string) ([]KVInfo, error)
+    Watch(ctx context.Context, filePath string) (current *WatchData, changes &lt;-chan *WatchData, err error)
+    NewLeaderParticipation(name, id string) (LeaderParticipation, error)
+    Lock(ctx context.Context, dirPath, contents string) (LockDescriptor, error)
+    Close()
+}</code></pre>
+      <div class="code-cite"><span class="file">go/vt/topo/conn.go</span></div>
+      <p>It's a versioned key-value store with watch + lock. <em>Anything</em> with those primitives can back Vitess.</p>
+    </section>
+
+    <section>
+      <h2>The implementations</h2>
+      <table>
+        <tr><th>Backend</th><th>Where</th><th>Notes</th></tr>
+        <tr><td>etcd</td><td><code>go/vt/topo/etcd2topo/</code></td><td>Recommended default; simplest ops</td></tr>
+        <tr><td>ZooKeeper</td><td><code>go/vt/topo/zk2topo/</code></td><td>Older deployments</td></tr>
+        <tr><td>consul</td><td><code>go/vt/topo/consultopo/</code></td><td>For consul shops</td></tr>
+        <tr><td>memory</td><td><code>go/vt/topo/memorytopo/</code></td><td>Tests only</td></tr>
+      </table>
+      <p>Choose at startup via flag: <code>--topo_implementation etcd2 --topo_global_server_address=...</code>.</p>
+    </section>
+
+    <section>
+      <h2>The high-level API: <code>topo.Server</code></h2>
+      <pre><code class="language-go">// abridged from go/vt/topo/server.go
+type Server struct {
+    globalCell  Conn
+    cellConns   map[string]Conn  // per-cell connection
+    // ...
+}
+
+func (ts *Server) GetKeyspace(ctx context.Context, keyspace string) (*KeyspaceInfo, error)
+func (ts *Server) GetShard(ctx context.Context, keyspace, shard string) (*ShardInfo, error)
+func (ts *Server) GetTablet(ctx context.Context, alias *topodatapb.TabletAlias) (*TabletInfo, error)
+func (ts *Server) GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*topodatapb.SrvKeyspace, error)
+func (ts *Server) UpdateShardFields(ctx context.Context, keyspace, shard string, update func(*topodatapb.Shard) error) (*ShardInfo, error)</code></pre>
+      <div class="code-cite"><span class="file">go/vt/topo/server.go</span></div>
+    </section>
+
+    <section>
+      <h2>Reading topo: <code>GetShard</code></h2>
+      <p>Conceptually:</p>
+      <ol>
+        <li>Compute the file path: <code>/keyspaces/&lt;keyspace&gt;/shards/&lt;shard&gt;/Shard</code></li>
+        <li>Call <code>conn.Get(path)</code> → bytes + version</li>
+        <li>Unmarshal into <code>topodatapb.Shard</code> (a protobuf)</li>
+        <li>Wrap in <code>ShardInfo</code> (carries version for optimistic updates)</li>
+      </ol>
+      <div class="callout">
+        <div class="callout-title">Version + lock = safe writes</div>
+        Updates go through <code>UpdateShardFields</code>, which reads, mutates, and writes-if-version-unchanged. This is how Vitess avoids torn writes across vtctld instances.
+      </div>
+    </section>
+
+    <section>
+      <h2>Locks</h2>
+      <pre><code class="language-go">// e.g. in vtctld during a reparent
+ctx, unlock, err := ts.LockShard(ctx, keyspace, shard, "reparent")
+if err != nil { return err }
+defer unlock(&amp;err)
+// ... mutate shard records ...</code></pre>
+      <ul>
+        <li>Locks are advisory but enforced by convention across vtctld &amp; vtorc.</li>
+        <li>Backed by the topo's primitive (etcd lease, ZK ephemeral node).</li>
+        <li>If holder dies, lease expires.</li>
+      </ul>
+      <p>See <span class="code-cite"><span class="file">go/vt/topo/locks.go</span></span>, <span class="code-cite"><span class="file">go/vt/topo/shard_lock.go</span></span>.</p>
+    </section>
+
+    <section>
+      <h2>Watches: how vtgate stays current</h2>
+      <ul>
+        <li>vtgate doesn't poll topo on every query — that would melt etcd.</li>
+        <li>It <em>watches</em> SrvKeyspace and SrvVSchema. Topo pushes deltas.</li>
+        <li>Local cache served, refreshed on watch events.</li>
+        <li><span class="code-cite"><span class="file">go/vt/srvtopo/</span></span> — the read-through cache layer on top of <code>topo</code>.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">When you change vschema</div>
+        Updates flow: vtctldclient → global topo → topo replicates to cell → vtgate watch fires → cache refresh. Sub-second normally, but not instant.
+      </div>
+    </section>
+
+    <section>
+      <h2>Inspecting topo from the CLI</h2>
+      <pre><code class="language-bash"># list keyspaces
+vtctldclient GetKeyspaces
+
+# list shards
+vtctldclient FindAllShardsInKeyspace commerce
+
+# list tablets
+vtctldclient GetTablets --keyspace commerce
+
+# read the vschema
+vtctldclient GetVSchema commerce</code></pre>
+      <p>And if you really want to see raw bytes (debug only):</p>
+      <pre><code class="language-bash">etcdctl --endpoints=http://localhost:2379 get --prefix /</code></pre>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">15-min explore</div>
+        With your local cluster running:
+        <ol>
+          <li><code>vtctldclient GetKeyspaces</code></li>
+          <li><code>vtctldclient GetShard commerce/0</code> — note the JSON shape; that's <code>topodatapb.Shard</code></li>
+          <li>Open <span class="code-cite"><span class="file">proto/topodata.proto</span></span> and find <code>message Shard</code> — match it up</li>
+          <li>Read <span class="code-cite"><span class="file">go/vt/topo/shard.go</span></span> — see how <code>GetShard</code> assembles the result</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. The same shard record could be modified by two vtctlds at once. How does topo prevent the lost update?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Every <code>Get</code> returns a version. Updates are conditional: "write iff version is X". One of the two updates fails the version check and retries. This is optimistic concurrency control — same idea as etcd revisions.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Why does vtgate <em>watch</em> SrvKeyspace instead of polling it?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Polling would either melt etcd or be slow to react to changes. Watches push deltas. vtgate caches locally and refreshes on watch events.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Where are tablet records stored — global or cell-local?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Cell-local. Each cell knows about its own tablets. Global topo holds cluster-wide things: keyspaces, vschema, locks.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>List the half-dozen object types in topo.</li>
+          <li>Pick the right backend (etcd by default, ZK/consul if you have them).</li>
+          <li>Inspect topo state with <code>vtctldclient</code>.</li>
+        </ul>
+      </div>
+      <p>Next: vtgate's request lifecycle, end to end.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/topo/server.go</span></span> — the package doc-comment</li>
+        <li><span class="code-cite"><span class="file">go/vt/topo/etcd2topo/server.go</span></span> — see a concrete impl</li>
+        <li><a href="https://vitess.io/docs/concepts/topology-service/" target="_blank">Vitess docs · topology service</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

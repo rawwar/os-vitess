@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 07 · High-Level Architecture</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="07" data-title="High-Level Architecture" data-part="Part II — Vitess at a Glance" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part II · Chapter 12</div>
+      <h1>The five processes.</h1>
+      <p class="subtitle">A minimal Vitess cluster has five kinds of process. Once you know what each does, the rest of the codebase organizes itself.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Name every process in a minimal cluster and its one-line job.</li>
+          <li>Trace a query from app to mysqld in 4 hops.</li>
+          <li>Locate the matching <code>go/cmd/&lt;binary&gt;/</code> and <code>go/vt/&lt;subsystem&gt;/</code> dirs.</li>
+          <li>Use analogies (router / sidecar / filing cabinet) when explaining to a non-Vitess person.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Vitess by analogy <span class="slide-badge beginner">Mental model</span></h2>
+      <table class="compare">
+        <tr><th>Component</th><th>Like a…</th><th>What it does</th></tr>
+        <tr><td><span class="g" data-term="vtgate">vtgate</span></td><td>receptionist / router</td><td>Greets every app connection; figures out which shard to ask.</td></tr>
+        <tr><td><span class="g" data-term="vttablet">vttablet</span></td><td>bodyguard</td><td>Sits next to each mysqld; rewrites queries; refuses bad ones.</td></tr>
+        <tr><td><span class="g" data-term="vtctld">vtctld</span></td><td>HR / ops</td><td>Long-running daemon for cluster admin commands.</td></tr>
+        <tr><td><span class="g" data-term="vtorc">vtorc</span></td><td>medic</td><td>Watches replication; promotes a replica when the primary dies.</td></tr>
+        <tr><td><span class="g" data-term="topo">topo</span></td><td>filing cabinet</td><td>Shared config store everyone reads from to coordinate.</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>The whole picture</h2>
+      <div class="mermaid">
+flowchart TB
+    App[Application] -->|MySQL protocol| VTGate[vtgate · stateless query router]
+    VTGate <-->|reads topo| Topo[(topo service<br/>etcd · ZK · consul)]
+    VTGate -->|gRPC<br/>QueryService| VTTablet[vttablet<br/>one per mysqld]
+    VTTablet --> MySQL[(mysqld<br/>actual data)]
+    VTCtld[vtctld · control plane] -->|reads/writes topo| Topo
+    VTCtld -->|gRPC<br/>TabletManager| VTTablet
+    VTOrc[vtorc · failover daemon] -->|watches topo<br/>watches replication| Topo
+    VTOrc --> VTCtld
+    Operator[operator / vtctldclient] --> VTCtld
+      </div>
+    </section>
+
+    <section>
+      <h2>vtgate</h2>
+      <ul>
+        <li><strong>What it is:</strong> a stateless TCP proxy that <em>looks like MySQL</em>.</li>
+        <li><strong>What it does:</strong> auth, parse SQL, look up vschema, plan, route, scatter-gather, return results.</li>
+        <li><strong>How you scale it:</strong> horizontally. Run as many vtgates as you need; round-robin them with a load balancer.</li>
+        <li><strong>Where it lives:</strong> <span class="code-cite"><span class="file">go/cmd/vtgate/</span></span> (entrypoint), <span class="code-cite"><span class="file">go/vt/vtgate/</span></span> (logic).</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Mental model</div>
+        vtgate <em>is</em> the database from the app's point of view. Everything that "feels like MySQL but smarter" — that's vtgate.
+      </div>
+    </section>
+
+    <section>
+      <h2>vttablet</h2>
+      <ul>
+        <li><strong>What it is:</strong> a sidecar process colocated with each mysqld.</li>
+        <li><strong>What it does:</strong> connection pooling, query rewriting (consistent across pools), schema tracking, txn lifecycle, replication tracking, throttling, online DDL.</li>
+        <li><strong>One per mysqld.</strong> If you have 100 shards × 3 replicas = 300 vttablets.</li>
+        <li><strong>Where it lives:</strong> <span class="code-cite"><span class="file">go/cmd/vttablet/</span></span> + <span class="code-cite"><span class="file">go/vt/vttablet/</span></span>.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Mental model</div>
+        vttablet is "MySQL, but with safety belts". It refuses to do stupid things, retries smart things, and translates between Vitess's RPC world and MySQL's wire world.
+      </div>
+    </section>
+
+    <section>
+      <h2>vtctld &amp; vtctldclient</h2>
+      <ul>
+        <li><strong>vtctld:</strong> the control plane. Long-running daemon that operators talk to.</li>
+        <li><strong>vtctldclient:</strong> the CLI you actually use day-to-day. RPCs to vtctld.</li>
+        <li>Used for: creating keyspaces, initializing shards, MoveTables, Reshard, OnlineDDL, backups, vdiff.</li>
+        <li><span class="code-cite"><span class="file">go/cmd/vtctld/</span></span>, <span class="code-cite"><span class="file">go/cmd/vtctldclient/</span></span>, <span class="code-cite"><span class="file">go/vt/vtctld/</span></span>.</li>
+      </ul>
+      <p>There's also a legacy <code>vtctl</code> binary; new commands go through vtctldclient.</p>
+    </section>
+
+    <section>
+      <h2>vtorc</h2>
+      <ul>
+        <li><strong>What it is:</strong> Vitess's fork of Orchestrator (born in MySQL ops land).</li>
+        <li><strong>What it does:</strong> watches replication topology; promotes a new primary when one fails.</li>
+        <li><strong>Where it lives:</strong> <span class="code-cite"><span class="file">go/cmd/vtorc/</span></span> + <span class="code-cite"><span class="file">go/vt/vtorc/</span></span>.</li>
+        <li><strong>Talks to:</strong> mysqld directly (for probing), topo (for cluster state), vtctld (to trigger PRS/ERS).</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">ERS = Emergency Reparent Shard</div>
+        When the primary is dead, vtorc triggers ERS — a careful protocol that promotes the most advanced replica. CLAUDE.md has strict rules about touching this code. We cover it in chapter 18.
+      </div>
+    </section>
+
+    <section>
+      <h2>The topology service</h2>
+      <ul>
+        <li><strong>What it is:</strong> a tiny configuration store with a strong consistency guarantee.</li>
+        <li><strong>What lives there:</strong> list of cells, keyspaces, shards, tablet records, vschema, routing rules, online DDL state.</li>
+        <li><strong>Implementations:</strong> etcd, ZooKeeper, consul. In-memory for tests.</li>
+        <li><span class="code-cite"><span class="file">go/vt/topo/</span></span> is the abstraction; subdirs are impls.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Mental model</div>
+        topo is "the filing cabinet". Vitess's processes coordinate by reading and writing files in this filing cabinet. Chapter 11 walks the code.
+      </div>
+    </section>
+
+    <section>
+      <h2>How they cooperate: a query in flight</h2>
+      <div class="mermaid">
+sequenceDiagram
+    participant App
+    participant vtgate
+    participant topo
+    participant vttablet
+    participant mysqld
+    App->>vtgate: SELECT * FROM customer WHERE id = 42
+    vtgate->>topo: GetSrvKeyspace("commerce") (cached)
+    vtgate->>vtgate: parse + plan: routes to shard "-80"
+    vtgate->>vttablet: ExecuteQuery (gRPC)
+    vttablet->>vttablet: rewrite, lease pool conn
+    vttablet->>mysqld: SELECT ...
+    mysqld-->>vttablet: rows
+    vttablet-->>vtgate: rows
+    vtgate-->>App: rows
+      </div>
+    </section>
+
+    <section>
+      <h2>And during a failover</h2>
+      <div class="mermaid">
+sequenceDiagram
+    participant vtorc
+    participant topo
+    participant vtctld
+    participant tabletA as primary tablet (dies)
+    participant tabletB as replica tablet
+    tabletA--xvtorc: probe fails
+    vtorc->>vtorc: confirm dead via topo / other tablets
+    vtorc->>vtctld: EmergencyReparentShard
+    vtctld->>topo: take shard lock
+    vtctld->>tabletB: find most-advanced replica
+    vtctld->>tabletB: promote to primary
+    vtctld->>topo: update shard record
+    vtctld->>topo: release lock
+      </div>
+    </section>
+
+    <section>
+      <h2>Cells: the unit of "datacenter"</h2>
+      <ul>
+        <li>A <strong>cell</strong> is one failure domain (usually one DC or one AZ).</li>
+        <li>Topo has a <em>global</em> cell + one per regional cell.</li>
+        <li>vtgate prefers tablets in its own cell; will failover across cells when needed.</li>
+      </ul>
+      <p>You'll see the term constantly: <code>cell</code>, <code>SrvKeyspace</code> (per-cell view), <code>--cells_to_watch</code>, etc.</p>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">10-min map</div>
+        <ol>
+          <li><code>ls go/cmd/</code> — count the binaries Vitess produces.</li>
+          <li><code>ls go/vt/</code> — see the matching impl packages.</li>
+          <li>Find the entrypoint of vtgate: <span class="code-cite"><span class="file">go/cmd/vtgate/vtgate.go</span></span>. It's tiny — most of it just delegates to <code>cli/</code>.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Which process is <em>stateless</em>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">vtgate. It holds no persistent state — everything it knows comes from topo or healthchecks. That's what lets you scale vtgates horizontally and replace them freely.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Why is there <em>one</em> vttablet per mysqld and not, say, one per shard?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">vttablet manages a specific mysqld process — connection pools, replication settings, schema reload. A shard has multiple mysqlds (primary + replicas), each with its own vttablet sidecar.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. The primary dies. Who notices first? Who decides what to do?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">vtorc notices (it's probing). It calls vtctld with "EmergencyReparentShard". vtctld coordinates: stop replication on all replicas, find the most-advanced one, promote it, point everyone else at the new primary.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Map every process to its <code>go/cmd/</code> and <code>go/vt/</code> dirs.</li>
+          <li>Explain a normal query in 4 hops.</li>
+          <li>Explain a failover in 5 hops.</li>
+        </ul>
+      </div>
+      <p>Next: an annotated tour of the repo.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><a href="https://vitess.io/docs/overview/architecture/" target="_blank">Vitess docs · architecture</a> (operator angle)</li>
+        <li><span class="code-cite"><span class="file">go/vt/topo/server.go</span></span> — read the doc-comment</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

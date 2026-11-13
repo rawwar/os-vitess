@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 17 · Tablet Manager RPCs</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="17" data-title="Tablet Manager RPCs" data-part="Part IV — vttablet: The Data Plane" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part IV · Chapter 22</div>
+      <h1>The control surface.</h1>
+      <p class="subtitle">When <span class="g" data-term="vtctld">vtctld</span> says "reparent" or "backup", it's calling these RPCs. The list is a great map of what a vttablet <em>can</em> do.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>List the major RPC files (<code>rpc_replication.go</code>, <code>rpc_backup.go</code>, ...).</li>
+          <li>Tell apart PRS (planned) and ERS (emergency) reparent.</li>
+          <li>Know why ERS code is "do not casually touch" territory.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>The package</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletmanager/</span></span> — RPC handlers grouped by topic.</li>
+        <li>Service definition: <span class="code-cite"><span class="file">proto/tabletmanagerservice.proto</span></span>; data shapes in <code>tabletmanagerdata.proto</code>.</li>
+        <li>Client: <span class="code-cite"><span class="file">go/vt/vttablet/tmclient/</span></span> (interface) + <code>grpctmclient/</code> (impl).</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>RPC files, grouped by job</h2>
+      <table>
+        <tr><th>File</th><th>Topic</th></tr>
+        <tr><td><code>rpc_actions.go</code></td><td>Ping, GetTablet, ChangeType, SetReadOnly, etc.</td></tr>
+        <tr><td><code>rpc_query.go</code></td><td>ExecuteFetchAsAllPrivs / AsDba — for vtctld to run admin SQL</td></tr>
+        <tr><td><code>rpc_schema.go</code></td><td>GetSchema, ReloadSchema, ApplySchema</td></tr>
+        <tr><td><code>rpc_replication.go</code></td><td>The big one: replication control + reparent primitives</td></tr>
+        <tr><td><code>rpc_backup.go</code></td><td>Backup / RestoreFromBackup</td></tr>
+        <tr><td><code>rpc_transaction.go</code></td><td>Reserved &amp; in-flight transactions</td></tr>
+        <tr><td><code>rpc_vreplication.go</code></td><td>VReplication workflow control</td></tr>
+        <tr><td><code>rpc_throttler.go</code></td><td>Read / set throttler config</td></tr>
+        <tr><td><code>rpc_vdiff.go</code></td><td>VDiff: cross-shard data comparison</td></tr>
+        <tr><td><code>rpc_lock_tables.go</code></td><td>For online DDL / backup</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>The reparent primitives</h2>
+      <p>In <span class="code-cite"><span class="file">rpc_replication.go</span></span>:</p>
+      <ul>
+        <li><strong>DemotePrimary</strong> — stop accepting writes, return current position</li>
+        <li><strong>UndoDemotePrimary</strong> — go back to PRIMARY (used if reparent aborts mid-way)</li>
+        <li><strong>PromoteReplica</strong> — promote this REPLICA to PRIMARY</li>
+        <li><strong>SetReplicationSource</strong> — point this tablet at a new source</li>
+        <li><strong>StopReplicationAndGetStatus</strong> — for ERS, find each replica's position</li>
+        <li><strong>WaitForPosition</strong> — wait until a tablet reaches a GTID</li>
+      </ul>
+      <p>These are the building blocks vtctld composes into <em>PlannedReparentShard</em> and <em>EmergencyReparentShard</em>.</p>
+    </section>
+
+    <section>
+      <h2>PlannedReparentShard (PRS)</h2>
+      <ul>
+        <li>You know the current primary is alive. You're just moving it.</li>
+        <li>Algorithm (rough):
+          <ol>
+            <li>DemotePrimary on old primary → returns last position</li>
+            <li>WaitForPosition on the new primary candidate</li>
+            <li>PromoteReplica on the candidate</li>
+            <li>SetReplicationSource on all the others → point at new primary</li>
+          </ol>
+        </li>
+        <li>Reliable. Use this for routine ops.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>EmergencyReparentShard (ERS)</h2>
+      <ul>
+        <li>Primary is dead or unreachable.</li>
+        <li>Must reason from replicas only.</li>
+        <li>Find the most-advanced replica via <code>StopReplicationAndGetStatus</code>.</li>
+        <li>Promote it; reset everyone else to follow.</li>
+      </ul>
+      <div class="callout danger">
+        <div class="callout-title">CLAUDE.md house rule</div>
+        "ERS must prioritize <em>certainty</em> that we picked the most-advanced candidate. Changes should prioritize reducing points of failure — avoid new RPCs or work that may delay or make ERS more brittle." Read that twice before touching these files.
+      </div>
+    </section>
+
+    <section>
+      <h2>tabletmanager state &amp; init</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">tm_init.go</span></span> — bootstrap a tablet: read topo, decide tablet type, register with healthcheck.</li>
+        <li><span class="code-cite"><span class="file">tm_state.go</span></span> — in-memory state for the tablet (type, replication state, etc.).</li>
+        <li><span class="code-cite"><span class="file">shard_sync.go</span></span> — keeps the tablet's view of its shard in sync with topo (e.g. learns of a new primary via watch).</li>
+        <li><span class="code-cite"><span class="file">shard_watcher.go</span></span> — watches topo for shard-level events.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>VDiff</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletmanager/vdiff/</span></span> — full sub-package.</li>
+        <li>Compares rows on the VReplication source vs. target.</li>
+        <li>Used to <em>verify</em> a MoveTables or Reshard before cutting over.</li>
+        <li>RPC entry points in <code>rpc_vdiff.go</code>.</li>
+      </ul>
+      <div class="callout success">
+        <div class="callout-title">Pattern to internalize</div>
+        Any time Vitess <em>copies</em> data (MoveTables, Reshard, Materialize), there's a matching <em>verify</em> step. VDiff is that verify.
+      </div>
+    </section>
+
+    <section>
+      <h2>Backups, from the tablet's view</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">rpc_backup.go</span></span> — <code>Backup</code> RPC, <code>RestoreFromBackup</code>.</li>
+        <li>Delegates to <span class="code-cite"><span class="file">go/vt/mysqlctl/</span></span> for the actual file work.</li>
+        <li>While a backup runs, vttablet sets itself NOT_SERVING.</li>
+        <li>RDONLY tablets are usually used as backup sources to avoid replica-traffic impact.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Locking tables</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">rpc_lock_tables.go</span></span> — <code>LockTables</code>, <code>UnlockTables</code>.</li>
+        <li>Used by VReplication during the cutover phase to freeze writes briefly.</li>
+        <li>Backed by MySQL's <code>LOCK TABLES</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">15-min walk</div>
+        <ol>
+          <li><code>vtctldclient PingTablet zone1-100</code> — find a tablet alias from <code>GetTablets</code>.</li>
+          <li>That hits <code>Ping</code> in <code>rpc_actions.go</code>. Open it; one-liner.</li>
+          <li>Read <code>DemotePrimary</code> in <code>rpc_replication.go</code> — appreciate how careful it is.</li>
+          <li>Find <code>PromoteReplica</code>. Note where it logs and on what context-cancel rules.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. When does vtctld call <code>DemotePrimary</code>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">During PlannedReparentShard (PRS), when the old primary is alive but being replaced. ERS skips DemotePrimary because the primary is dead.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Why is "most-advanced replica" a fragile concept across async replicas?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Without semi-sync, the primary may have committed transactions no replica saw. "Most-advanced" picks the best of bad options. Semi-sync guarantees at least one replica has the data the primary acked.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Why does the CLAUDE.md house rule warn against touching ERS code lightly?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">ERS runs when something is already broken. New RPCs or extra hops add new failure modes precisely when reliability matters most. "Reduce points of failure" trumps clever optimizations here.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Locate any TabletManager RPC by topic in <code>rpc_*.go</code>.</li>
+          <li>Tell apart PRS and ERS, both at a high level.</li>
+          <li>Respect the "do not lightly touch ERS" rule.</li>
+        </ul>
+      </div>
+      <p>Next: how vtorc decides to call ERS in the first place.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">proto/tabletmanagerservice.proto</span></span> — every RPC in one file</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtctl/reparentutil/</span></span> — the PRS/ERS composition logic (we'll touch it in chapter 23)</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

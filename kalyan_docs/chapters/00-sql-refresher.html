@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 02 · SQL Refresher</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="02" data-title="SQL Refresher" data-part="Part 0 — Foundations Before Vitess" style="display:none;"></div>
+
+  <div id="slides">
+
+    <section class="title-slide" id="hero">
+      <div class="part-tag">Part 0 · Chapter 2</div>
+      <h1>The SQL you need.</h1>
+      <p class="subtitle">A focused refresher on the SQL you'll see throughout this course. We'll use a tiny e-commerce schema that you'll meet again in chapters 4, 14, 22, and 25 — so it's worth memorizing the table names.</p>
+    </section>
+
+    <section id="objectives">
+      <h2>What this chapter gives you</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Read a multi-table <code>SELECT</code> with <code>JOIN</code>, <code>GROUP BY</code>, and aggregates without flinching.</li>
+          <li>Know what <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code> do and what could go wrong.</li>
+          <li>Explain what an <span class="g" data-term="index">index</span> is — and why <em>more indexes</em> can be a bad thing.</li>
+          <li>Use a <span class="g" data-term="transaction">transaction</span> correctly and know what <span class="g" data-term="vitess">Vitess</span> changes about it.</li>
+          <li>Recognize <code>NULL</code> traps that bite even experienced developers.</li>
+        </ul>
+      </div>
+      <p>This isn't a complete SQL textbook. It's the subset of SQL you actually need to follow every other chapter in this course. If you're already fluent in SQL, skim this chapter — you'll still want to read the "What Vitess changes about transactions" section.</p>
+    </section>
+
+    <section id="schema">
+      <h2>Our sample schema</h2>
+      <p>Throughout this course we'll use the same e-commerce schema: four small tables representing customers, products, orders, and order lines. The Vitess local example (chapter 14) uses the same schema, so what you learn here will translate directly when we run real queries through <span class="g" data-term="vtgate">vtgate</span> later.</p>
+<pre><code class="language-sql">CREATE TABLE customer (
+  customer_id  INT PRIMARY KEY,
+  email        VARCHAR(128) NOT NULL,
+  country      VARCHAR(2)   NOT NULL
+);
+
+CREATE TABLE product (
+  product_id   INT PRIMARY KEY,
+  name         VARCHAR(64),
+  price_cents  INT NOT NULL
+);
+
+CREATE TABLE corder (
+  order_id     INT PRIMARY KEY,
+  customer_id  INT NOT NULL,
+  created_at   DATETIME NOT NULL
+);
+
+CREATE TABLE order_line (
+  order_id     INT NOT NULL,
+  product_id   INT NOT NULL,
+  quantity     INT NOT NULL,
+  PRIMARY KEY (order_id, product_id)
+);</code></pre>
+      <p>Two things to notice. First, <code>order_line</code> has a <em>composite</em> primary key — the combination of <code>order_id</code> and <code>product_id</code> is unique, not either column alone. This pattern shows up constantly in real schemas. Second, the orders table is called <code>corder</code>, not <code>order</code>. <code>ORDER</code> is a SQL reserved word (think <code>ORDER BY</code>); many setups won't let you name a table that way without painful quoting. Vitess's local demo uses the same workaround. Make peace with the name now.</p>
+    </section>
+
+    <section id="select">
+      <h2>SELECT: fetching rows</h2>
+      <p>A <code>SELECT</code> statement reads rows from one or more tables. The clauses run in a specific order even though you write them in another. Read SQL roughly right-to-left in your head: <code>FROM</code> picks the table, <code>WHERE</code> filters rows, <code>SELECT</code> picks which columns to return, <code>ORDER BY</code> sorts, and <code>LIMIT</code> trims. The English-style ordering of clauses is convenient to write but doesn't reflect execution order.</p>
+<pre><code class="language-sql">-- Get one customer
+SELECT customer_id, email
+FROM customer
+WHERE customer_id = 1;
+
+-- Filter by another column
+SELECT email FROM customer WHERE country = 'US';
+
+-- Sort and limit
+SELECT customer_id, email
+FROM customer
+ORDER BY email
+LIMIT 10;</code></pre>
+      <p>The first query returns a single row (because <code>customer_id</code> is the primary key, unique by definition). The second returns all US customers. The third sorts by email and returns the first ten — useful for paging through a long list.</p>
+      <div class="callout">
+        <div class="callout-title">Why this matters for Vitess</div>
+        When you run that first query through vtgate against a sharded keyspace, vtgate uses <code>customer_id = 1</code> to figure out which exact shard owns that row, and sends the query only there. The second query, without a vindex predicate, becomes a <strong>scatter</strong> — sent to every shard and combined. The third's sort behaves differently across shards (each shard sorts its slice; vtgate merges). All of this is the planner's job, but it's grounded in plain SQL like this.
+      </div>
+    </section>
+
+    <section id="join">
+      <h2>JOIN: combining tables</h2>
+      <p>Real queries rarely touch just one table. A <code>JOIN</code> stitches rows from two tables together based on a matching condition.</p>
+<pre><code class="language-sql">-- Each customer paired with their orders
+SELECT c.customer_id, c.email, o.order_id, o.created_at
+FROM customer c
+JOIN corder o ON o.customer_id = c.customer_id
+WHERE c.customer_id = 1;</code></pre>
+      <p>That's an <strong>INNER JOIN</strong> (the default when you just write <code>JOIN</code>). It returns only rows where both sides match — customers <em>with</em> at least one order. Customers who have never ordered won't appear.</p>
+      <p>A <strong>LEFT JOIN</strong> keeps every row from the left-side table even if the right side has nothing to match. Columns from the right side become <code>NULL</code> for those rows, which is exactly how you find "customers who have never ordered":</p>
+<pre><code class="language-sql">SELECT c.customer_id, c.email
+FROM customer c
+LEFT JOIN corder o ON o.customer_id = c.customer_id
+WHERE o.order_id IS NULL;</code></pre>
+      <p>The <code>IS NULL</code> at the end is the trick — for customers with no orders, the right-side columns are <code>NULL</code>, so <code>o.order_id IS NULL</code> matches them.</p>
+    </section>
+
+    <section id="join-practice">
+      <h2>Worked example: a four-way join</h2>
+      <p>To make this concrete, here's a real question: <em>how much has each customer spent in total?</em> We need to join four tables — customer to order to order_line to product — and aggregate the totals.</p>
+<pre><code class="language-sql">SELECT c.customer_id,
+       SUM(ol.quantity * p.price_cents) AS spend_cents
+FROM customer c
+JOIN corder o      ON o.customer_id = c.customer_id
+JOIN order_line ol ON ol.order_id   = o.order_id
+JOIN product p     ON p.product_id  = ol.product_id
+GROUP BY c.customer_id
+ORDER BY spend_cents DESC;</code></pre>
+      <p>Walk it slowly. <code>FROM customer c</code> starts with every customer. The first <code>JOIN</code> pairs each customer with their orders. The second joins each order to its line items. The third joins each line item to the product (for the price). At that point each row in the joined result contains: a customer, an order, a line, and that line's product — including <code>quantity</code> and <code>price_cents</code>. We compute <code>quantity * price_cents</code> for each row, group by customer, and sum the per-row spend.</p>
+      <p>This is a perfectly normal query against a single MySQL. Through Vitess, on a keyspace sharded by <code>customer_id</code>, it still works — but the planner has to send it to every shard, aggregate per-shard, and combine the results at vtgate. Chapter 19 (the planner) and chapter 20 (the engine) trace exactly how.</p>
+    </section>
+
+    <section id="predict-join">
+      <h2>Predict the output</h2>
+      <div class="predict">
+        <div class="predict-title">Quick check</div>
+        Given the rows:
+<pre><code class="language-text">customer       corder
+1 alice US     101  cust=1 2024-01-01
+2 bob   IN     102  cust=1 2024-02-01
+3 carol US     103  cust=3 2024-03-01</code></pre>
+        What does this return?
+<pre><code class="language-sql">SELECT c.customer_id, COUNT(o.order_id) AS orders
+FROM customer c
+LEFT JOIN corder o ON o.customer_id = c.customer_id
+GROUP BY c.customer_id
+ORDER BY c.customer_id;</code></pre>
+      </div>
+      <div class="quiz">
+        <details>
+          <summary>Reveal the answer</summary>
+          <div class="quiz-a">
+<pre><code class="language-text">customer_id | orders
+1           | 2
+2           | 0
+3           | 1</code></pre>
+            Bob has no orders, but the LEFT JOIN keeps his row anyway. <code>COUNT(o.order_id)</code> counts non-null order IDs, so Bob gets 0, not 1 (and not <code>NULL</code>). If you wrote <code>COUNT(*)</code> instead, Bob would have 1 — because <code>COUNT(*)</code> counts the row regardless of nulls. This kind of distinction is exactly why <code>NULL</code> is the most-debated feature in SQL.
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section id="groupby">
+      <h2>GROUP BY and aggregates</h2>
+      <p>An <strong>aggregate</strong> collapses many rows into one. <code>COUNT</code>, <code>SUM</code>, <code>MIN</code>, <code>MAX</code>, and <code>AVG</code> are the five you'll see most.</p>
+      <p><code>GROUP BY</code> partitions the rows by some column(s), then applies the aggregate to each group. The result has one row per group:</p>
+<pre><code class="language-sql">-- Number of orders per customer
+SELECT customer_id, COUNT(*) AS n_orders
+FROM corder
+GROUP BY customer_id;
+
+-- Total revenue per product, top first
+SELECT ol.product_id, SUM(ol.quantity * p.price_cents) AS revenue
+FROM order_line ol
+JOIN product p ON p.product_id = ol.product_id
+GROUP BY ol.product_id
+ORDER BY revenue DESC;</code></pre>
+      <p>The rule of thumb: in a query with <code>GROUP BY</code>, every column in the <code>SELECT</code> list must either appear in the <code>GROUP BY</code> or be wrapped in an aggregate function. (Some MySQL configurations relax this, with surprising results. Don't rely on that.)</p>
+      <div class="callout">
+        <div class="callout-title">Aggregates across shards</div>
+        Aggregates that "compose" — <code>SUM</code>, <code>COUNT</code>, <code>MIN</code>, <code>MAX</code> — are easy for Vitess to scatter: each shard returns its partial result, vtgate combines them. <code>AVG</code> is trickier: averaging averages is wrong. So Vitess asks each shard for <code>SUM</code> and <code>COUNT</code> separately and divides at the end. This kind of detail lives in <code>go/vt/vtgate/engine/aggregations.go</code>; we'll read it in chapter 20.
+      </div>
+    </section>
+
+    <section id="dml">
+      <h2>INSERT, UPDATE, DELETE</h2>
+      <p>The three statements that actually change data are forgivingly simple:</p>
+<pre><code class="language-sql">INSERT INTO customer (customer_id, email, country)
+VALUES (4, 'dave@example.com', 'US');
+
+UPDATE customer
+SET country = 'UK'
+WHERE customer_id = 4;
+
+DELETE FROM customer WHERE customer_id = 4;</code></pre>
+      <p>And forgivingly dangerous. An <code>UPDATE</code> without a <code>WHERE</code> updates <em>every row</em> in the table. Same for <code>DELETE</code>. There is no undo (outside of restoring from a backup, which usually means hours of downtime).</p>
+      <div class="callout danger">
+        <div class="callout-title">The unfiltered UPDATE / DELETE</div>
+        Before running a destructive statement, get into the habit of running the equivalent <code>SELECT</code> first to see exactly which rows you're about to change.<br><br>
+        Step 1: <code>SELECT * FROM customer WHERE country = 'XX';</code><br>
+        Step 2: <em>look at the result</em>.<br>
+        Step 3: only then, <code>UPDATE customer SET ... WHERE country = 'XX';</code><br><br>
+        Many production query rules (including Vitess's <code>--queryserver-config-strict-table-acl</code> and the vttablet rules engine) exist specifically to prevent these mistakes.
+      </div>
+    </section>
+
+    <section id="indexes">
+      <h2>What is an index, really?</h2>
+      <p>Rows live on disk in pages (chapter 3 makes this concrete). To find <code>customer_id = 42</code> without an <span class="g" data-term="index">index</span>, the database has to scan every row in the table, comparing each — that's <code>O(N)</code> work. An <strong>index</strong> is a separate, sorted lookup structure that lets the database jump straight to the row in <code>O(log N)</code> time.</p>
+      <div class="annotated">
+        <div class="anno-step"><span class="anno-num">1</span><strong>Without an index:</strong> scan every row.</div>
+        <div class="mermaid">
+flowchart LR
+    q[query: id=42] --> r1[row 1]
+    r1 --> r2[row 2]
+    r2 --> r3[row 3]
+    r3 --> rmore[...]
+    rmore --> rN[row N]
+        </div>
+      </div>
+      <div class="annotated">
+        <div class="anno-step"><span class="anno-num">2</span><strong>With an index:</strong> tree lookup, ~4-5 hops for a billion rows.</div>
+        <div class="mermaid">
+flowchart TB
+    root["[50]"] --> a["[20]"]
+    root --> b["[80]"]
+    a --> a1["rows 1-19"]
+    a --> a2["rows 20-49"]
+    b --> b1["rows 50-79"]
+    b --> b2["rows 80-N"]
+        </div>
+      </div>
+      <p>Indexes have a real cost. They consume disk space (a few percent of the table size, usually). More importantly, every <code>INSERT</code>, <code>UPDATE</code>, or <code>DELETE</code> on the table has to update every index that mentions the affected columns. More indexes mean faster reads on the indexed columns and <em>slower writes on the whole table</em>. There's no free lunch.</p>
+    </section>
+
+    <section id="index-misconceptions">
+      <h2>Common misconceptions about indexes</h2>
+      <div class="callout misc">
+        <div class="callout-title">"An index is just a copy of the table"</div>
+        It's a separate sorted structure, but it usually stores only the indexed columns plus a pointer to the row (in InnoDB, that pointer is the primary key, not a physical address). It's smaller than the table — sometimes much smaller.
+      </div>
+      <div class="callout misc">
+        <div class="callout-title">"More indexes = faster"</div>
+        Faster reads on the indexed columns. <em>Slower writes on the whole table</em>. The database has to maintain every index on every relevant change. Most production tables sit at 3-7 indexes total; more than that should be justified by query-pattern data.
+      </div>
+      <div class="callout misc">
+        <div class="callout-title">"<code>WHERE email LIKE '%@gmail.com'</code> will use the email index"</div>
+        No. B-tree indexes work left-to-right — the database can find a prefix, but can't seek by a suffix. A leading <code>%</code> wildcard defeats the index and forces a full scan. <code>WHERE email LIKE 'alice%'</code> <em>does</em> use the index.
+      </div>
+    </section>
+
+    <section id="transactions">
+      <h2>Transactions: all or nothing</h2>
+      <p>A <span class="g" data-term="transaction">transaction</span> is a group of statements that succeed or fail as a unit. Either every statement takes effect (<code>COMMIT</code>) or none do (<code>ROLLBACK</code>).</p>
+<pre><code class="language-sql">BEGIN;
+  INSERT INTO corder (order_id, customer_id, created_at)
+    VALUES (104, 1, NOW());
+  INSERT INTO order_line (order_id, product_id, quantity)
+    VALUES (104, 7, 2);
+COMMIT;</code></pre>
+      <p>If the second <code>INSERT</code> fails (maybe product 7 doesn't exist, and there's a foreign key constraint), the first one is also rolled back. The database moves from one consistent state to another without ever exposing the in-between.</p>
+      <p>The three commands:</p>
+      <ul>
+        <li><code>BEGIN</code> (or <code>START TRANSACTION</code>) — open a transaction.</li>
+        <li><code>COMMIT</code> — finalize all changes since BEGIN.</li>
+        <li><code>ROLLBACK</code> — discard all changes since BEGIN.</li>
+      </ul>
+      <p>Transactions are the foundation of every reliable application. The reason your bank balance doesn't randomly disappear is, in part, that the transfer-money operation is wrapped in a transaction. Vitess preserves these guarantees within a single shard with no asterisk.</p>
+    </section>
+
+    <section id="transactions-vitess">
+      <h2>What Vitess changes about transactions</h2>
+      <p>In plain MySQL, a transaction lives on one server. In Vitess, a transaction <em>could</em> touch multiple shards — multiple MySQLs running on different machines. That changes the rules in a way you have to internalize before reading any Vitess code.</p>
+      <div class="cols">
+        <div>
+          <h3>Single-shard transaction</h3>
+          <p>Full MySQL guarantees apply. <code>BEGIN</code>, statements, <code>COMMIT</code> behave exactly as you'd expect on plain MySQL.</p>
+          <p>This is the case for any query whose <code>WHERE</code> clause includes the shard key with an equality predicate.</p>
+        </div>
+        <div>
+          <h3>Cross-shard transaction</h3>
+          <p>Each shard's piece commits independently. If shard 2 fails after shard 1 already committed, you have a <em>partial commit</em> — unless you've opted into two-phase commit (2PC), which adds latency and complexity.</p>
+          <p>Most apps avoid this by designing the schema so related rows live on the same shard.</p>
+        </div>
+      </div>
+      <p>This is one of the deepest design constraints in Vitess. We'll see how it's implemented in chapter 17 (vtgate's transaction handling) and chapter 22 (vttablet's transaction engine).</p>
+    </section>
+
+    <section id="null">
+      <h2>NULL traps</h2>
+      <p><code>NULL</code> is SQL's way of saying "unknown". It is not zero, it is not the empty string, and it is not false. Critically, <code>NULL = NULL</code> is <em>not</em> true — it's <code>NULL</code>, because "is unknown equal to unknown?" is itself unknown.</p>
+      <p>This trips up everyone. A few traps:</p>
+<pre><code class="language-sql">-- This finds ZERO rows, even if hundreds have NULL country:
+SELECT * FROM customer WHERE country = NULL;
+
+-- This is the correct way to look for nulls:
+SELECT * FROM customer WHERE country IS NULL;
+
+-- COUNT(col) ignores NULLs:
+SELECT COUNT(country) FROM customer;
+-- This returns the number of NON-NULL country values.
+
+-- COUNT(*) counts every row, NULL or not:
+SELECT COUNT(*) FROM customer;
+
+-- Arithmetic propagates NULL:
+SELECT 1 + NULL;  -- returns NULL, not 1.</code></pre>
+      <p>Anytime a column is nullable, you have to think about what your query does with the nulls. The shortest debugging session of your life will end when you realize <code>WHERE col != 'x'</code> excluded all the rows where <code>col</code> is <code>NULL</code> — because <code>NULL != 'x'</code> is <code>NULL</code>, not true.</p>
+    </section>
+
+    <section id="lab">
+      <h2>Lab: try the schema yourself</h2>
+      <div class="lab">
+        <div class="lab-title">25 minutes · SQLite (no install) or any MySQL</div>
+        <p>Pick whatever's easiest:</p>
+        <ul>
+          <li><strong>Easiest:</strong> <a href="https://sqlite.org/fiddle/" target="_blank">sqlite.org/fiddle</a> in a browser tab.</li>
+          <li><strong>If you have MySQL locally:</strong> <code>mysql -uroot</code>, then pick a scratch database.</li>
+          <li><strong>Once you've reached chapter 14:</strong> use the real Vitess cluster you built. The schema is already loaded.</li>
+        </ul>
+        <ol>
+          <li>Paste the four <code>CREATE TABLE</code> statements from the "Our sample schema" section.</li>
+          <li>Insert some data: <pre><code class="language-sql">INSERT INTO customer VALUES (1,'alice@example.com','US'),(2,'bob@example.com','IN'),(3,'carol@example.com','US');
+INSERT INTO product  VALUES (7,'mug',999),(8,'book',1999);
+INSERT INTO corder   VALUES (101,1,'2024-01-01'),(102,1,'2024-02-01'),(103,3,'2024-03-01');
+INSERT INTO order_line VALUES (101,7,2),(102,8,1),(103,7,3);</code></pre></li>
+          <li>Find each customer's total spend in cents (the four-way-join query from earlier).</li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">Expected output (your sort order may vary)</div>
+<pre class="expected">customer_id | spend_cents
+1           |  3997
+3           |  2997
+</pre>
+        </div>
+        <p>If you got those numbers, you're ready for everything that follows. If not, walk through the four joins in the worked-example section above and compare row by row.</p>
+      </div>
+    </section>
+
+    <section id="quiz">
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. What does <code>LEFT JOIN</code> guarantee that <code>INNER JOIN</code> doesn't?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Every row from the left-side table appears in the result, even if no matching row exists on the right. Right-side columns will be <code>NULL</code> for those rows.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. <code>WHERE country = NULL</code> on a 1000-row table where 50 rows have <code>NULL</code> country returns how many rows?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Zero. <code>= NULL</code> is never true; the result is always <code>NULL</code>, which doesn't match. You need <code>IS NULL</code>.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. You added five new indexes to speed up a slow report. The report is now fast, but <code>INSERT</code> latency tripled. Why?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Every INSERT now updates five additional index structures. Reads were the bottleneck; you traded write throughput to fix it. Often the right call — but it should be a conscious trade-off, not an accident.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">4. Inside a single MySQL, a transaction guarantees atomicity. What's different when that transaction touches two Vitess shards by default?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Each shard's piece commits independently. If the second shard fails after the first committed, you have a partial commit. Vitess offers two-phase commit (2PC) as an opt-in to fix this, with a latency cost. Most apps avoid the situation by keeping related rows on the same shard.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">5. In our schema, why is the orders table called <code>corder</code> instead of <code>order</code>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>ORDER</code> is a SQL reserved word (as in <code>ORDER BY</code>). Naming a table with a reserved word requires quoting it everywhere, which gets old fast. <code>corder</code> ("customer order") sidesteps the issue. The Vitess local demo uses the same trick.</div></details>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Read a multi-table <code>SELECT</code> with joins and aggregates.</li>
+          <li>Explain why indexes speed up reads but slow writes.</li>
+          <li>Use transactions correctly — and know that cross-shard transactions in Vitess add a real catch.</li>
+          <li>Spot the most common <code>NULL</code> traps.</li>
+          <li>Recognize the e-commerce schema (<code>customer</code>, <code>product</code>, <code>corder</code>, <code>order_line</code>) you'll reuse.</li>
+        </ul>
+      </div>
+      <p>Next chapter: under the hood. What is the database <em>actually doing</em> when you run that <code>SELECT</code>? Pages, B+ trees, locks, MVCC. We zoom out from SQL syntax to the storage layer below it.</p>
+    </section>
+
+    <section id="further-reading">
+      <h2>Further reading</h2>
+      <ul>
+        <li><a href="https://use-the-index-luke.com/" target="_blank">use-the-index-luke.com</a> — the best free book on database indexes. Especially the first three chapters.</li>
+        <li><a href="https://dev.mysql.com/doc/refman/8.0/en/sql-statements.html" target="_blank">MySQL Reference Manual · SQL statements</a> — the authoritative reference.</li>
+        <li><a href="https://dev.mysql.com/doc/refman/8.0/en/working-with-null.html" target="_blank">MySQL Reference Manual · Working with NULL</a> — short and worth re-reading.</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

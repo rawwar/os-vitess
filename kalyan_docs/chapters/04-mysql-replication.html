@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 04 · MySQL Replication &amp; GTIDs</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="04" data-title="MySQL Replication &amp; GTIDs" data-part="Part I — MySQL from a Code Perspective" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part I · Chapter 9</div>
+      <h1>Binlogs &amp; GTIDs.</h1>
+      <p class="subtitle">If MySQL is a tree of writes, the <span class="g" data-term="binlog">binlog</span> is the audit log of that tree. Vitess reads it for breakfast.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Draw the primary → replicas picture and label which side writes the binlog.</li>
+          <li>Tell apart STATEMENT, ROW, MIXED — and know why Vitess needs ROW.</li>
+          <li>Describe a <span class="g" data-term="gtid">GTID</span> and why it makes failover much easier.</li>
+          <li>Find Vitess's flavor abstraction in <code>go/mysql/flavor.go</code>.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Replication in plain English <span class="slide-badge beginner">Beginner</span></h2>
+      <p>One MySQL is the <strong>primary</strong>. It accepts every <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>. Each change is appended to the binlog.</p>
+      <p>Other MySQLs are <strong>replicas</strong>. They open a long-running connection to the primary, stream the binlog, and replay each event locally.</p>
+      <p>Result: replicas have (almost) the same data as the primary, slightly delayed. Apps can read from them to scale read throughput.</p>
+      <div class="callout">
+        <div class="callout-title">Why Vitess loves this</div>
+        Replication is also how Vitess <em>moves</em> data — between shards, into new shards, into shadow tables for online DDL. Same engine, different consumers.
+      </div>
+    </section>
+
+    <section>
+      <h2>The basic picture</h2>
+      <div class="mermaid">
+flowchart LR
+    Client[client] -->|INSERT/UPDATE| Primary[(primary mysqld)]
+    Primary -->|binlog dump| Replica1[(replica)]
+    Primary -->|binlog dump| Replica2[(replica)]
+    Primary -. binlog file .- Disk[(binlog files)]
+      </div>
+      <ul>
+        <li>Primary writes every change to its <strong>binary log</strong>.</li>
+        <li>Replicas open a "binlog dump" connection and stream events.</li>
+        <li>Replicas apply events to their own copy of the data.</li>
+        <li>Replication is async by default; semi-sync is opt-in (replicas ack receipt before primary commits).</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Binlog format: STATEMENT vs ROW vs MIXED</h2>
+      <table>
+        <tr><th>Format</th><th>What's logged</th><th>Pro</th><th>Con</th></tr>
+        <tr><td>STATEMENT</td><td>The SQL string</td><td>Compact</td><td>Non-deterministic queries (NOW(), UUID(), AUTO_INC races) diverge replicas</td></tr>
+        <tr><td>ROW</td><td>Before/after row images</td><td>Always replays exactly</td><td>Bigger, no SQL-text grep</td></tr>
+        <tr><td>MIXED</td><td>STATEMENT, falls back to ROW</td><td>Best of both</td><td>Surprising switches</td></tr>
+      </table>
+      <div class="callout danger">
+        <div class="callout-title">Vitess requires ROW</div>
+        VReplication relies on row images. STATEMENT-based binlogs <em>will not work</em> with VReplication. See <span class="code-cite"><span class="file">go/mysql/binlog_event_rbr.go</span></span> for the row-event parser.
+      </div>
+    </section>
+
+    <section>
+      <h2>What a binlog event looks like (mentally)</h2>
+      <pre><code class="language-text"># at 1234
+#220312 10:00:01 server id 1  end_log_pos 1300
+GTID 3E11FA47-71CA-11E1-9E33-C80AA9429562:7
+BEGIN
+# at 1300
+TABLE_MAP_EVENT: db=commerce, table=customer
+WRITE_ROWS_EVENT:
+  INSERT INTO `commerce`.`customer` VALUES (42, 'alice@example.com')
+# at 1500
+XID 67890
+COMMIT</code></pre>
+      <ul>
+        <li><strong>TABLE_MAP_EVENT</strong> tells you the table schema (column types) for the upcoming row events.</li>
+        <li><strong>WRITE/UPDATE/DELETE_ROWS_EVENT</strong> carries the actual row images.</li>
+        <li><strong>XID</strong> marks transaction commit.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>GTIDs: every transaction has a name</h2>
+      <ul>
+        <li><strong>GTID = Global Transaction ID.</strong> Unique across the replication topology.</li>
+        <li>MySQL format: <code>server-uuid:transaction-number</code>, e.g. <code>3E11FA47-...:42</code>.</li>
+        <li>MariaDB has its own GTID format: <code>domain-server_id-sequence</code>, e.g. <code>0-1-100</code>.</li>
+        <li>Replicas track which GTIDs they've executed; if they reconnect, they ask for "everything after X".</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Why Vitess loves GTIDs</div>
+        Without GTIDs, a replica reconnecting to a new primary has to be told "start at byte 1,234,567 of binlog file mysql-bin.000042" — which only the old primary knew. With GTIDs, any replica can say "I'm at GTID X, give me the rest" to anyone.
+      </div>
+    </section>
+
+    <section>
+      <h2>Vitess's GTID code</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/mysql/replication/replication_position.go</span></span> — <code>Position</code> &amp; <code>GTIDSet</code>, abstraction across flavors.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/replication/gtid.go</span></span> — the <code>GTID</code> interface.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/replication/mysql56_gtid.go</span></span> — MySQL 5.6+ GTID format.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/replication/mariadb_gtid.go</span></span> — MariaDB GTID format.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/replication/filepos_gtid.go</span></span> — legacy "binlog file + position" mode (works without GTIDs).</li>
+      </ul>
+      <p>The <code>flavor</code> abstraction (chapter 5) is what lets Vitess speak to MySQL, MariaDB, and Percona without branching on version mid-function.</p>
+    </section>
+
+    <section>
+      <h2>Semi-sync vs async, and why Vitess cares</h2>
+      <ul>
+        <li><strong>Async:</strong> primary commits, then writes to binlog, then notifies replicas. If primary dies, last few txns can be lost.</li>
+        <li><strong>Semi-sync:</strong> primary waits for <em>at least one replica</em> to ack receipt of the event before returning COMMIT to the client.</li>
+        <li>Vitess strongly encourages semi-sync — VTOrc (chapter 18) failover depends on at least one replica having the data.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">"Lossless" failovers need semi-sync</div>
+        EmergencyReparentShard's correctness story assumes the most-advanced replica has the data. Without semi-sync, "most advanced replica" can still be behind the failed primary.
+      </div>
+    </section>
+
+    <section>
+      <h2>How replication looks from Go</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/mysql/binlog_dump.go</span></span> — sends <code>COM_BINLOG_DUMP_GTID</code> to start streaming.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/binlog_event.go</span></span> — the <code>BinlogEvent</code> interface; methods like <code>IsGTID()</code>, <code>IsTableMap()</code>, <code>Rows()</code>.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/binlog_event_common.go</span></span> — common header parsing.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/binlog_event_mysql56.go</span></span> — version-specific bits.</li>
+      </ul>
+      <p>VReplication (chapter 21) is essentially: open a binlog dump on the source, decode events, transform, apply on the target. Everything else is bookkeeping.</p>
+    </section>
+
+    <section>
+      <h2>Common misconceptions</h2>
+      <div class="callout misc">
+        <div class="callout-title">"Async replication still loses no data"</div>
+        Async means primary doesn't wait. If the primary dies <em>between</em> binlog write and replica fetch, those events are gone. Use semi-sync for stronger guarantees.
+      </div>
+      <div class="callout misc">
+        <div class="callout-title">"GTIDs replace binlog positions"</div>
+        GTIDs are <em>identifiers</em> for transactions. Binlog files still exist; GTIDs just give every transaction a name that doesn't depend on which file/byte it was in. Both coexist.
+      </div>
+      <div class="callout misc">
+        <div class="callout-title">"STATEMENT format is fine for replication"</div>
+        For simple cases yes. But <code>UPDATE x SET created_at = NOW()</code> can produce different results on the replica's clock. Vitess <em>requires</em> ROW so VReplication can apply rows precisely.
+      </div>
+    </section>
+
+    <section>
+      <h2>Try it yourself <span class="slide-badge lab">Lab</span></h2>
+      <div class="lab">
+        <div class="lab-title">10 min · any MySQL with binlogs on</div>
+        <ol>
+          <li>Make sure binlog is on: <pre><code class="language-sql">SHOW VARIABLES LIKE 'log_bin';
+SHOW VARIABLES LIKE 'binlog_format';</code></pre> If <code>binlog_format</code> isn't <code>ROW</code>, the next steps still work but events will look different.</li>
+          <li>Look at current state: <pre><code class="language-sql">SHOW MASTER STATUS;
+SHOW BINARY LOGS;</code></pre></li>
+          <li>Pick the most recent file from <code>SHOW BINARY LOGS</code>, then dump its tail: <pre><code class="language-sql">SHOW BINLOG EVENTS IN 'binlog.000001' LIMIT 20;</code></pre></li>
+          <li>Make a tiny change: <pre><code class="language-sql">CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY);
+INSERT INTO t VALUES (1);</code></pre></li>
+          <li>Re-run the binlog events query. Your INSERT should appear.</li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">What to notice</div>
+          <ul>
+            <li>You'll see <code>Anonymous_Gtid</code> or a <code>Gtid</code> event marking your transaction.</li>
+            <li>If binlog format is <code>ROW</code>, you'll see a <code>Table_map</code> event followed by a <code>Write_rows</code> event — not the literal SQL.</li>
+            <li>This is exactly the byte stream that <span class="g" data-term="vreplication">VReplication</span> consumes.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Why does Vitess <em>require</em> ROW format, not STATEMENT?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">VReplication reapplies events on a different shard or different schema. STATEMENT-based replication can produce different results when re-executed (NOW(), AUTO_INCREMENT, etc.). ROW format records the exact before/after row values — deterministic.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Without GTIDs, what does a replica say to reconnect to its source?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">"Start at byte X of file Y." That only makes sense to the original primary. If the primary moves, the position is meaningless. With GTIDs the replica says "I've executed up to GTID Z" — meaningful to any source.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Why is semi-sync important for Vitess failover correctness?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">When the primary dies, Vitess picks the most-advanced replica to promote. Semi-sync guarantees at least one replica had the data the primary acked to clients — so the "most advanced" replica really does have everything.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Sketch primary + replicas + binlog stream.</li>
+          <li>Pick ROW format and know why.</li>
+          <li>Define a GTID in one sentence.</li>
+          <li>Point at <code>go/mysql/replication/</code> and <code>go/mysql/binlog_event_*.go</code> as Vitess's view of all this.</li>
+        </ul>
+      </div>
+      <p>Next: the wire protocol itself, in Go.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li>MySQL Reference Manual · "Replication Implementation"</li>
+        <li>MySQL Reference Manual · "Using GTIDs for Failover and Scaleout"</li>
+        <li><span class="code-cite"><span class="file">go/mysql/replication/</span></span> — read the package-level doc comment in <code>replication.go</code></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

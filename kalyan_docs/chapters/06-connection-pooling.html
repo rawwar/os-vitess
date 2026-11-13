@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 06 · Connection Lifecycle &amp; Pooling</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="06" data-title="Connection Lifecycle &amp; Pooling" data-part="Part I — MySQL from a Code Perspective" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part I · Chapter 11</div>
+      <h1>Pools, all the way down.</h1>
+      <p class="subtitle">Every "connection" you see at the Vitess boundary is actually a leased slot from a <span class="g" data-term="pool">pool</span>. Knowing the layers protects you from the most common production foot-guns.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Explain why a pool exists in one sentence.</li>
+          <li>Name vttablet's three pools and what each holds.</li>
+          <li>Recognize the symptoms of pool exhaustion in logs.</li>
+          <li>Trace a transaction's life through vtgate → vttablet → mysqld.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Why pools exist</h2>
+      <ul>
+        <li>Opening a TCP connection + handshake + auth costs ~1-5 ms. Per query, that's catastrophic.</li>
+        <li>MySQL has a hard cap (<code>max_connections</code>, default 151). Crossing it = "Too many connections" errors.</li>
+        <li>Pools amortize handshake cost and bound concurrency.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">The Vitess invariant</div>
+        Apps may open thousands of connections to vtgate. vtgate keeps a small bounded pool to each shard. <em>Connection count amplification is exactly inverted</em> — that's the headline value.
+      </div>
+    </section>
+
+    <section>
+      <h2>The pool hierarchy in Vitess</h2>
+      <div class="mermaid">
+flowchart TB
+    Apps[App connections<br/>thousands] --> VTGate[vtgate<br/>listener]
+    VTGate --> VTPool[per-tablet RPC pool]
+    VTPool -->|gRPC| VTTablet[vttablet]
+    VTTablet --> QPool[query pool]
+    VTTablet --> TxPool[tx pool]
+    VTTablet --> APool[appserver pool]
+    QPool --> MySQL[(mysqld)]
+    TxPool --> MySQL
+    APool --> MySQL
+      </div>
+      <p>vttablet keeps <strong>three separate pools</strong> to its mysqld: read-only queries, transactions, and "DBA" (admin) work.</p>
+    </section>
+
+    <section>
+      <h2>Generic pool primitives</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/pools/resource_pool.go</span></span> — generic Get/Put pool with min/max size, idle timeout, wait queue.</li>
+        <li><span class="code-cite"><span class="file">go/pools/smartconnpool/</span></span> — newer "smart" pool tuned for DB connections (less lock contention, better metrics).</li>
+        <li><span class="code-cite"><span class="file">go/pools/numbered.go</span></span> — pool of resources keyed by ID (used for active transactions).</li>
+        <li><span class="code-cite"><span class="file">go/pools/rpc_pool.go</span></span> — RPC concurrency limiter.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The <code>Resource</code> interface</h2>
+      <pre><code class="language-go">// In go/pools/resource_pool.go
+type Resource interface {
+    Close()
+    Expired(lifetimeTimeout time.Duration) bool
+    ApplySetting(ctx context.Context, setting *Setting) error
+    IsSettingApplied() bool
+    ResetSetting(ctx context.Context) error
+    Setting() *Setting
+}</code></pre>
+      <ul>
+        <li>Anything that can be pooled implements this.</li>
+        <li><strong>Setting</strong> is a tiny but interesting feature — a pooled MySQL conn may have session vars set on it; on return, we reset them.</li>
+        <li>This lets vtgate pretend to be stateful (per-app SET) over a stateless pool.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>vttablet's three pools, in code</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/connpool/</span></span> — the connpool package shared by all three.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/tx_engine.go</span></span> — the tx pool; transactions live as numbered resources.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/query_engine.go</span></span> — wires the read-only conn pool to the executor.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">Watch for these in PRs</div>
+        Flags like <code>--queryserver-config-pool-size</code>, <code>--queryserver-config-transaction-cap</code>. Misconfiguring them is the #1 cause of "vttablet is rejecting queries under load".
+      </div>
+    </section>
+
+    <section>
+      <h2>The transaction lifecycle</h2>
+      <ol>
+        <li>App: <code>BEGIN</code> arrives at vtgate.</li>
+        <li>vtgate: routes to a shard (or several), tells each vttablet "start txn".</li>
+        <li>vttablet: leases a conn from the <strong>tx pool</strong>, runs <code>BEGIN</code> on it, returns a <code>transaction_id</code>.</li>
+        <li>App: sends queries with that txn id; vttablet looks up the leased conn.</li>
+        <li>App: <code>COMMIT</code>. vttablet runs <code>COMMIT</code>, returns the conn to the pool.</li>
+      </ol>
+      <p>Look at <span class="code-cite"><span class="file">go/vt/vttablet/tabletmanager/rpc_transaction.go</span></span> for the RPC plumbing.</p>
+    </section>
+
+    <section>
+      <h2>Pool exhaustion → timeouts → cascading failure</h2>
+      <ul>
+        <li>If all pool slots are leased and a new caller arrives, the pool either <strong>waits</strong> (up to a timeout) or <strong>rejects</strong>.</li>
+        <li>In Vitess, this surfaces as <code>resource pool timed out</code> errors with vterrors code <code>RESOURCE_EXHAUSTED</code>.</li>
+        <li>The lesson: <strong>long transactions = held pool slots = blocked everyone else</strong>.</li>
+      </ul>
+      <div class="callout danger">
+        <div class="callout-title">Anti-pattern</div>
+        Opening a Vitess transaction, then doing slow work in the app (HTTP call, etc.) before committing. That conn is locked the entire time. <em>Don't.</em>
+      </div>
+    </section>
+
+    <section>
+      <h2><code>dbconnpool</code> — the older, simpler pool</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/dbconnpool/</span></span> — older pool used by vtctld, mysqlctl, etc.</li>
+        <li>Wraps <span class="code-cite"><span class="file">go/mysql/Conn</span></span> in a poolable resource.</li>
+        <li>Simpler than vttablet's, no transaction tracking.</li>
+      </ul>
+      <p>vttablet has moved to <code>smartconnpool</code>; <code>dbconnpool</code> remains for the control-plane bits.</p>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">15-minute walk</div>
+        <ol>
+          <li>Open <span class="code-cite"><span class="file">go/pools/resource_pool.go</span></span> and find the <code>Get</code> method. See how it handles the wait + timeout case.</li>
+          <li>Open <span class="code-cite"><span class="file">go/pools/smartconnpool/</span></span> and skim <code>pool.go</code>. The optimizations are about avoiding a central mutex.</li>
+          <li>Grep <code>poolSize</code> across <code>go/vt/vttablet/</code> to see how many separate pool configs exist.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Why does a transaction hold a pool slot the entire time it's open?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">A MySQL connection is stateful inside a transaction — the BEGIN locked the conn, subsequent statements must run on the same conn, COMMIT/ROLLBACK releases it. vttablet can't reuse it in the meantime.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. What error do you see in logs when a pool is exhausted?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>resource pool timed out</code> with gRPC code <code>RESOURCE_EXHAUSTED</code>. Symptom: slow queries pile up; healthy queries fail despite mysqld looking idle.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. What's the difference between <code>smartconnpool</code> and the older <code>resource_pool</code>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">smartconnpool reduces lock contention and tracks connection settings (session vars) per slot. It's the modern choice; resource_pool is still used in older code paths (vtctld, mysqlctl).</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap — and end of Part I</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Name the three pools and what each holds.</li>
+          <li>Diagnose pool exhaustion from a log line.</li>
+          <li>Explain why long transactions hurt everyone, not just the slow caller.</li>
+        </ul>
+      </div>
+      <p>Part I recap:</p>
+      <ul>
+        <li>MySQL = server layer + InnoDB. Binlog is the audit log of writes.</li>
+        <li>GTIDs make replication topology-independent. Vitess depends on them.</li>
+        <li>Wire protocol is binary, length-prefixed, packet-framed.</li>
+        <li>Pools are everywhere; understand the layers or get bitten.</li>
+      </ul>
+      <p>Part II starts next: zoom out and learn the Vitess pieces as a whole.</p>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

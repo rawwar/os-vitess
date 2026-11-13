@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 27 · Your First Pull Request</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="27" data-title="Your First Pull Request" data-part="Part VI — Contributing to Vitess" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part VI · Chapter 32</div>
+      <h1>Ship something.</h1>
+      <p class="subtitle">You've read 31 chapters. Now turn that into a PR. This chapter is the checklist I wish I'd had.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Pick a sensible first issue to work on.</li>
+          <li>Walk the local development loop (edit → test → commit → push → PR).</li>
+          <li>Write a PR description Vitess maintainers will actually read.</li>
+          <li>Read CI failures and tell flake from real failure.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Pick a first PR</h2>
+      <ul>
+        <li><strong>Good first issue</strong> label on <a href="https://github.com/vitessio/vitess/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22" target="_blank">GitHub</a>.</li>
+        <li><strong>Docs typos</strong> — but note: account-age rule. New accounts (&lt;365 days) can't submit pure spelling/grammar PRs (see CONTRIBUTING.md).</li>
+        <li><strong>Flaky tests</strong> — often have a small root cause and high impact.</li>
+        <li><strong>Small flag additions</strong> — gives you a tour of flag → config → behavior plumbing.</li>
+      </ul>
+      <p>Don't start with planner internals. Start with something you can finish in a day.</p>
+    </section>
+
+    <section>
+      <h2>Discuss first (sometimes)</h2>
+      <ul>
+        <li><strong>Tiny fix:</strong> just open a PR.</li>
+        <li><strong>Anything design-shaped:</strong> open an issue first, propose the approach, get a nod.</li>
+        <li><strong>Touches public API or RPC schema:</strong> definitely an issue first.</li>
+        <li>The Vitess Slack <code>#dev</code> channel is the fastest path to "is this worth doing?".</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The git workflow</h2>
+      <pre><code class="language-bash">git checkout -b fix-typo-tablet-alias
+# ... make changes ...
+gofumpt -w &lt;files&gt;
+goimports -local "vitess.io/vitess" -w &lt;files&gt;
+go test ./go/...path-of-changes/...
+git add &lt;explicit paths&gt;        # NOT git add -A
+git commit --signoff -m "fix: tablet alias formatting in error msg"
+git push origin fix-typo-tablet-alias
+# Open PR on github.com/vitessio/vitess</code></pre>
+      <div class="callout warn">
+        <div class="callout-title">DCO sign-off is required</div>
+        Every commit must have <code>Signed-off-by: Name &lt;email&gt;</code>. The <code>--signoff</code> flag adds it; without it, the DCO bot blocks merge.
+      </div>
+    </section>
+
+    <section>
+      <h2>What the bots check</h2>
+      <ul>
+        <li><strong>DCO</strong> — every commit signed off.</li>
+        <li><strong>cla-bot</strong> — CNCF CLA (auto-confirmed via DCO for individual contributors).</li>
+        <li><strong>gofmt / gofumpt / goimports</strong> — formatting.</li>
+        <li><strong>golangci-lint</strong> — many checks.</li>
+        <li><strong>Unit tests</strong> — must pass.</li>
+        <li><strong>e2e matrix</strong> — many suites; often the long pole.</li>
+        <li><strong>codecov</strong> — coverage delta reported, not enforced.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Commit message style</h2>
+      <pre><code class="language-text">vtgate: fix off-by-one in shard range calculation
+
+When a vindex returned a keyspace ID exactly at the shard
+boundary, the planner was sending the row to the wrong shard.
+
+Add the boundary value to the lower-shard's range, matching
+documentation in proto/topodata.proto.
+
+Signed-off-by: Your Name &lt;you@example.com&gt;</code></pre>
+      <ul>
+        <li>Subject: imperative ("fix", "add", "update"), package prefix, ≤ 72 chars.</li>
+        <li>Blank line, then explain <em>why</em>. The diff already shows <em>what</em>.</li>
+        <li>Reference issues if any: <code>Fixes #12345</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>PR title &amp; description</h2>
+      <ul>
+        <li>Title: same shape as commit subject; reviewers triage from this.</li>
+        <li>Description sections (template auto-fills):
+          <ul>
+            <li><strong>What is changing &amp; why?</strong></li>
+            <li><strong>Related issues</strong></li>
+            <li><strong>Tests added</strong></li>
+            <li><strong>Documentation</strong></li>
+            <li><strong>Migration notes / impact</strong></li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Release notes</h2>
+      <ul>
+        <li>If your PR is user-visible (new flag, behavior change, bug fix), add a release-note entry.</li>
+        <li>Lives in <span class="code-cite"><span class="file">changelog/&lt;version&gt;/&lt;release&gt;/summary.md</span></span></li>
+        <li>Keep it user-focused. Internal refactors don't need entries.</li>
+        <li>CLAUDE.md: "Changelog summaries are for key changes all users should know about — internal implementation details don't belong there."</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Review feedback: receiving it well</h2>
+      <ul>
+        <li>Reviewers will be direct. Don't take it personally.</li>
+        <li>Address every comment — either fix or reply with reasoning.</li>
+        <li>Push <strong>new commits</strong>, don't amend (per CLAUDE.md, after the PR exists).</li>
+        <li>Mark conversations resolved when addressed; let the reviewer re-open if needed.</li>
+        <li>It's normal for a first PR to take 3-4 iterations.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Common gotchas (real ones)</h2>
+      <div class="callout danger">
+        <div class="callout-title">Editing generated files</div>
+        Open a "Code generated ... DO NOT EDIT" file by mistake? Discard the edit, find the source, re-generate.
+      </div>
+      <div class="callout danger">
+        <div class="callout-title">Wrong flag style</div>
+        New flag with an underscore (<code>--my_flag</code>) will fail review. Use hyphens.
+      </div>
+      <div class="callout danger">
+        <div class="callout-title">Bare errors</div>
+        <code>fmt.Errorf("...")</code> instead of <code>vterrors.Errorf(...)</code>. Reviewers will catch this — better to learn the patterns now.
+      </div>
+      <div class="callout danger">
+        <div class="callout-title">Adding unrelated diffs</div>
+        Touching <code>go.sum</code>, <code>package-lock.json</code>, or formatting changes to files you didn't otherwise edit. Keep PRs focused.
+      </div>
+    </section>
+
+    <section>
+      <h2>If CI fails</h2>
+      <ol>
+        <li>Read the failing log — usually obvious.</li>
+        <li>Reproduce locally: <code>go test ./path/...</code> or the exact e2e suite name.</li>
+        <li>If it's a known flake (search GitHub Issues for the test name), comment on the PR; a maintainer can re-run.</li>
+        <li>Fix &amp; push. New commit; <em>don't</em> amend.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>After merge</h2>
+      <ul>
+        <li>Your change ships in the next minor release (typically every ~3 months).</li>
+        <li>Major bugs may get backported to active LTS branches by maintainers (see <code>.claude/skills/resolve-backport/</code>).</li>
+        <li>You're now in <code>git log</code> forever. Congrats.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Where to go from here</h2>
+      <ul>
+        <li>Subscribe to the Vitess Slack <code>#dev</code> and <code>#release</code>.</li>
+        <li>Watch the repo on GitHub — see how big PRs get reviewed.</li>
+        <li>Pick a subsystem; become its expert. The maintainers love when contributors specialize.</li>
+        <li>Attend a monthly Vitess community meeting (calendar on <a href="https://vitess.io/community/" target="_blank">vitess.io/community</a>).</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Closing thoughts</h2>
+      <blockquote>
+        Vitess is a 15-year-old codebase running at planet scale. It rewards careful reading, asking good questions, and shipping <em>small</em> changes that fit the existing style.
+      </blockquote>
+      <p>The best way to learn this codebase is to <em>change it</em>. Pick something, ship it, iterate.</p>
+      <p>Good luck!</p>
+    </section>
+
+    <section>
+      <h2>First-contribution simulator <span class="slide-badge lab">Lab · 45 min</span></h2>
+      <div class="lab">
+        <div class="lab-title">Practice the full loop without pushing</div>
+        <ol>
+          <li><strong>Find a tiny existing test.</strong> <pre><code class="language-bash">rg "func Test" go/vt/sqlparser/parse_test.go | head -5</code></pre> Pick one (e.g., <code>TestKeywords</code>).</li>
+          <li><strong>Read it.</strong> Understand what it asserts. <pre><code class="language-bash">less go/vt/sqlparser/parse_test.go</code></pre> Find the test function by name.</li>
+          <li><strong>Make a harmless local-only change.</strong> Edit a string literal in a test case. Save.</li>
+          <li><strong>Run the test.</strong> It should fail because you changed the expectation. <pre><code class="language-bash">go test -run TestKeywords ./go/vt/sqlparser/ -v</code></pre> Read the error output — get used to its shape.</li>
+          <li><strong>Inspect the diff.</strong> <pre><code class="language-bash">git diff go/vt/sqlparser/parse_test.go</code></pre></li>
+          <li><strong>Revert it.</strong> <pre><code class="language-bash">git checkout -- go/vt/sqlparser/parse_test.go</code></pre> Confirm: <code>git status</code> shows no changes.</li>
+          <li><strong>Re-run the test.</strong> Passes again.</li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">What you just simulated</div>
+          The full local development loop — minus the push. When you do this for real, the only extra steps are <code>git commit --signoff</code> and <code>git push</code>.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>PR descriptions: good vs. weak <span class="slide-badge beginner">Examples</span></h2>
+      <div class="cols">
+        <div>
+          <h3 style="color: var(--red);">Weak</h3>
+<pre><code class="language-text">Title: fix bug
+
+Body:
+fixes the issue with planning
+
+(no test, no context, no
+linked issue)</code></pre>
+          <p style="font-size: 0.75em; color: var(--fg-muted);">Reviewer has no idea what changed or why. Will sit for weeks.</p>
+        </div>
+        <div>
+          <h3 style="color: var(--green);">Good</h3>
+<pre><code class="language-text">Title: vtgate: fix off-by-one
+in shard range calculation
+
+Body:
+## What
+A keyspace ID at exactly the
+shard boundary was routed to
+the wrong shard.
+
+## Why
+Documentation in
+proto/topodata.proto says
+the lower bound is inclusive.
+
+## Test
+Added testdata case
+boundary_cases.json with
+3 boundary values.
+
+Fixes #12345</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>CI failure: flake vs real <span class="slide-badge beginner">Triage</span></h2>
+      <table class="compare">
+        <tr><th>Looks like</th><th>Probably</th><th>What to do</th></tr>
+        <tr><td>Same test, same line, always fails on your branch</td><td>Real failure</td><td>Reproduce locally, fix.</td></tr>
+        <tr><td>"context deadline exceeded" mid-test</td><td>Flake on a slow runner</td><td>Comment "re-run CI" — a maintainer will trigger a retry.</td></tr>
+        <tr><td>Lint complains about a file you didn't touch</td><td>Pre-existing on main</td><td>Rebase onto latest main; if persists, mention in PR.</td></tr>
+        <tr><td>Test fails referencing port 3306 / etcd</td><td>Resource conflict on runner</td><td>Almost always a flake. Re-run.</td></tr>
+      </table>
+      <div class="callout">
+        <div class="callout-title">Search before re-running</div>
+        Search GitHub Issues for the failing test name. If a "flaky test" issue exists, you've confirmed it's not your fault. Link it in your PR.
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. You forgot the DCO sign-off on your commit. What happens, and how do you fix?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">DCO bot blocks merge. Easiest fix: add a new commit with sign-off (<code>--allow-empty -s -m "DCO sign-off"</code>) and push. Or, only if your PR is fresh, amend the previous commit with <code>--signoff</code> and force-push (acceptable on a brand-new PR; never after review starts).</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. After a reviewer asks for changes, do you amend or add new commits?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Add new commits. CLAUDE.md is explicit: never amend or force-push after a PR is open. Keeps history reviewable.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Your PR is a user-visible behavior change. What else must you add?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">A release-note entry under <code>changelog/&lt;version&gt;/&lt;release&gt;/summary.md</code>. User-focused — not internal implementation details.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Pick a sensible first issue.</li>
+          <li>Run the full local edit → test → revert loop without fear.</li>
+          <li>Write a PR description with sections: What / Why / Test / Fixes.</li>
+          <li>Triage CI failures and re-run when appropriate.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>The map again, for your future self</h2>
+      <ul>
+        <li><strong>Style:</strong> CLAUDE.md</li>
+        <li><strong>Build:</strong> bootstrap.sh, dev.env, make build</li>
+        <li><strong>Run:</strong> examples/local/</li>
+        <li><strong>Top of vtgate:</strong> go/vt/vtgate/executor.go</li>
+        <li><strong>Top of vttablet:</strong> go/vt/vttablet/tabletserver/tabletserver.go</li>
+        <li><strong>SQL parser:</strong> go/vt/sqlparser/</li>
+        <li><strong>Vindexes:</strong> go/vt/vtgate/vindexes/</li>
+        <li><strong>VReplication:</strong> go/vt/vttablet/tabletmanager/vreplication/</li>
+        <li><strong>Topo:</strong> go/vt/topo/</li>
+        <li><strong>Tests:</strong> go/test/endtoend/ + plan_test.go</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>You made it.</h2>
+      <p>From "what's a binlog?" to "I know where the gen4 planner lives." That's a real jump.</p>
+      <p>Open the repo. Read one file. Then another. Keep going.</p>
+      <p style="margin-top: 36px;">
+        <a href="../index.html" style="background: linear-gradient(135deg, var(--vitess), var(--accent-2)); color: white; padding: 12px 22px; border-radius: 8px; font-weight: 600; text-decoration: none;">← Back to chapter list</a>
+      </p>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

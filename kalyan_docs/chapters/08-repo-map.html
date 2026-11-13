@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 08 · The Repository Map</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="08" data-title="The Repository Map" data-part="Part II — Vitess at a Glance" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part II · Chapter 13</div>
+      <h1>Where everything lives.</h1>
+      <p class="subtitle">An annotated tour of the top-level directories. Bookmark this chapter; you'll come back.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Recognize <code>go/</code>, <code>proto/</code>, <code>examples/</code>, <code>test/</code> at the top level.</li>
+          <li>Tell which directories under <code>go/vt/</code> matter for which subsystem.</li>
+          <li>Know the rule: never edit anything labeled "Code generated … DO NOT EDIT".</li>
+          <li>Locate the entrypoint of any Vitess binary in under 30 seconds.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Where to start vs. ignore <span class="slide-badge beginner">Beginner</span></h2>
+      <table class="compare">
+        <tr><th>Start here</th><th>Ignore (until later)</th></tr>
+        <tr><td><code>examples/local/</code></td><td><code>java/</code> (JDBC driver)</td></tr>
+        <tr><td><code>go/cmd/</code> (entrypoints)</td><td><code>go/vt/proto/</code> (generated)</td></tr>
+        <tr><td><code>go/vt/vtgate/</code></td><td><code>go/vt/sqlparser/ast_clone.go</code> + sibling generated files</td></tr>
+        <tr><td><code>go/vt/vttablet/tabletserver/</code></td><td><code>web/</code> (vtadmin frontend)</td></tr>
+        <tr><td><code>CLAUDE.md</code></td><td><code>doc/</code> security PDFs</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Repo root</h2>
+      <table>
+        <tr><th>Path</th><th>Role</th></tr>
+        <tr><td><code>go/</code></td><td>All Go source code. ~95% of the project.</td></tr>
+        <tr><td><code>proto/</code></td><td>Protobuf definitions. <strong>Source of truth</strong> for all gRPC.</td></tr>
+        <tr><td><code>examples/</code></td><td>Runnable local clusters (the <code>local/</code> one is the canonical demo).</td></tr>
+        <tr><td><code>test/</code></td><td>End-to-end test config + Python helpers.</td></tr>
+        <tr><td><code>web/</code></td><td>vtadmin web UI.</td></tr>
+        <tr><td><code>java/</code></td><td>JDBC driver, gRPC Java client.</td></tr>
+        <tr><td><code>config/</code></td><td>Default config files for mysqld variants.</td></tr>
+        <tr><td><code>doc/</code></td><td>Design docs (yes, real ones) and audit PDFs.</td></tr>
+        <tr><td><code>changelog/</code></td><td>Per-release notes.</td></tr>
+        <tr><td><code>docker/</code></td><td>Dockerfiles for the various Vitess containers.</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2><code>go/cmd/</code> — the binaries</h2>
+      <table>
+        <tr><th>Binary</th><th>What it is</th></tr>
+        <tr><td><code>vtgate</code></td><td>Query router</td></tr>
+        <tr><td><code>vttablet</code></td><td>MySQL sidecar</td></tr>
+        <tr><td><code>vtctld</code></td><td>Control plane daemon</td></tr>
+        <tr><td><code>vtctldclient</code></td><td>Modern admin CLI</td></tr>
+        <tr><td><code>vtctl</code></td><td>Legacy admin CLI</td></tr>
+        <tr><td><code>vtorc</code></td><td>Failover daemon</td></tr>
+        <tr><td><code>mysqlctl</code> / <code>mysqlctld</code></td><td>Manage a mysqld process</td></tr>
+        <tr><td><code>vtbackup</code></td><td>Take a backup from a standalone replica</td></tr>
+        <tr><td><code>vtexplain</code></td><td>Show how vtgate would plan/route a query</td></tr>
+        <tr><td><code>vtadmin</code></td><td>vtadmin web backend</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2><code>go/vt/</code> — the implementation</h2>
+      <ul>
+        <li><code>vtgate/</code> — planner, executor, plan tests, vindexes</li>
+        <li><code>vttablet/</code> — tabletserver (query path), tabletmanager (control), vreplication, onlineddl</li>
+        <li><code>vtctld/</code>, <code>vtctl/</code>, <code>wrangler/</code> — admin / workflow code</li>
+        <li><code>vtorc/</code> — failover daemon</li>
+        <li><code>topo/</code> — topology service abstraction + implementations</li>
+        <li><code>sqlparser/</code> — SQL parsing, AST, normalizer, formatter</li>
+        <li><code>mysqlctl/</code> — managing mysqld + backups</li>
+        <li><code>schema/</code>, <code>schemadiff/</code> — schema tracking and diffing</li>
+        <li><code>binlog/</code> — binlog consumption helpers</li>
+        <li><code>vterrors/</code> — error wrapping with gRPC codes</li>
+        <li><code>proto/</code> — <em>generated</em> Go code from <code>proto/</code></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2><code>go/</code> support libraries (not vt-specific)</h2>
+      <ul>
+        <li><code>go/mysql/</code> — wire protocol, binlog events, charsets</li>
+        <li><code>go/pools/</code> — generic pool primitives</li>
+        <li><code>go/sqltypes/</code> — the canonical row/value type. <strong>You'll see <code>sqltypes.Value</code> everywhere.</strong></li>
+        <li><code>go/sqlescape/</code> — SQL identifier/literal escaping</li>
+        <li><code>go/cache/</code> — TheineW cache, used for prepared statement caching, etc.</li>
+        <li><code>go/stats/</code> — Vitess's own metrics library (predates Prometheus)</li>
+        <li><code>go/trace/</code> — distributed tracing helpers (OpenTelemetry-backed)</li>
+        <li><code>go/event/</code> — pub/sub helpers for cluster events</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Inside <code>go/vt/vtgate/</code></h2>
+      <ul>
+        <li><code>executor.go</code> — top-level "given SQL, give me a result"</li>
+        <li><code>plan_execute.go</code> — runs a plan against the cluster</li>
+        <li><code>planbuilder/</code> — SQL → plan (huge, recursive)</li>
+        <li><code>engine/</code> — plan primitives: <code>Route</code>, <code>Join</code>, <code>Limit</code>, <code>Aggregate</code></li>
+        <li><code>vindexes/</code> — sharding functions (hash, lookup, consistent_lookup, …)</li>
+        <li><code>evalengine/</code> — pure-Go expression evaluator (constants, simple math)</li>
+        <li><code>buffer/</code> — buffers writes during reparents</li>
+        <li><code>plugin_mysql_server.go</code> — the MySQL <code>Handler</code> for vtgate</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Inside <code>go/vt/vttablet/</code></h2>
+      <ul>
+        <li><code>tabletserver/</code> — the query path. <strong>QueryService</strong> interface, query rewriting, conn pools, transaction engine.</li>
+        <li><code>tabletmanager/</code> — the control path. RPCs from vtctld; ChangeType, Reparent, Backup.</li>
+        <li><code>tabletmanager/vreplication/</code> — VReplication engine</li>
+        <li><code>onlineddl/</code> — online DDL state machine</li>
+        <li><code>tabletconn/</code>, <code>grpctabletconn/</code> — vtgate → vttablet client</li>
+        <li><code>tmclient/</code>, <code>grpctmclient/</code> — vtctld → vttablet client</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2><code>proto/</code> — the source of truth for RPCs</h2>
+      <ul>
+        <li>Every gRPC service in Vitess has a <code>.proto</code> here.</li>
+        <li><code>topodata.proto</code>, <code>vtgate.proto</code>, <code>query.proto</code>, <code>tabletmanagerdata.proto</code>, etc.</li>
+        <li>Generated Go lives in <code>go/vt/proto/&lt;name&gt;/</code> with a "DO NOT EDIT" header.</li>
+        <li>To change wire schemas: edit <code>.proto</code> + run <code>make proto</code>.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">House rule</div>
+        Never edit anything under <code>go/vt/proto/</code> directly. Run <code>make proto</code>. (See CLAUDE.md, "Protobufs".)
+      </div>
+    </section>
+
+    <section>
+      <h2><code>go/test/endtoend/</code></h2>
+      <ul>
+        <li>Real Vitess clusters spun up by tests; SQL run against them.</li>
+        <li>Hundreds of subdirs, organized by feature: <code>vreplication/</code>, <code>onlineddl/</code>, <code>sharding/</code>, <code>vtgate/</code>, …</li>
+        <li>Slow — these are the "did we break anything serious?" gate.</li>
+      </ul>
+      <p>We learn how to run them in chapter 26. They live behind <code>./test.go</code>.</p>
+    </section>
+
+    <section>
+      <h2>Top-level files worth opening once</h2>
+      <ul>
+        <li><code>CLAUDE.md</code> — the style guide. Already cited many times in this tutorial.</li>
+        <li><code>CONTRIBUTING.md</code> — short; mostly points at vitess.io/contributing.</li>
+        <li><code>Makefile</code> — discoverable: <code>make help</code>, <code>make build</code>, <code>make proto</code>, <code>make codegen</code>.</li>
+        <li><code>bootstrap.sh</code> + <code>dev.env</code> — set up the Go toolchain, MySQL flavor, etc.</li>
+        <li><code>test.go</code> — runs end-to-end suites.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">15-minute scavenger hunt</div>
+        Open these files and read the package-level <code>doc.go</code>-style comments:
+        <ol>
+          <li><span class="code-cite"><span class="file">go/vt/vtgate/executor.go</span></span> (top)</li>
+          <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/tabletserver.go</span></span> (top)</li>
+          <li><span class="code-cite"><span class="file">go/vt/topo/server.go</span></span> (top)</li>
+          <li><span class="code-cite"><span class="file">go/vt/sqlparser/ast.go</span></span> (top)</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. You want to change a gRPC schema. Which file do you edit, and what command do you run after?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Edit the <code>.proto</code> file under <code>proto/</code>. Run <code>make proto</code> to regenerate Go code under <code>go/vt/proto/</code>. Never edit <code>go/vt/proto/</code> by hand.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Where would you start reading to understand <em>vttablet's query path</em>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>go/vt/vttablet/tabletserver/tabletserver.go</code>, then <code>query_engine.go</code> and <code>tx_engine.go</code> next to it.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Where do end-to-end tests live, and why are they slow?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>go/test/endtoend/</code>. Each test boots a small real cluster (mysqld + vtctld + vtgate + vttablets) and runs SQL through it. Reality > speed for these.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Find any subsystem's code from its name (vtgate, vttablet, sqlparser, mysqlctl, …).</li>
+          <li>Recognize generated files by their first line.</li>
+          <li>Know where to ignore (Java, vtadmin web) until later.</li>
+        </ul>
+      </div>
+      <p>Now that the map is in your head, let's actually <strong>run</strong> Vitess. Chapter 14 (formerly Chapter 9) walks through the build and the local example.</p>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

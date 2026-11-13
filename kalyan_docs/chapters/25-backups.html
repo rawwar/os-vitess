@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 25 · Backups &amp; Restores</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="25" data-title="Backups &amp; Restores" data-part="Part V — Sharding &amp; VReplication" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part V · Chapter 30</div>
+      <h1>Backups.</h1>
+      <p class="subtitle">The least glamorous, most critical subsystem. Vitess's design makes "restore a dead replica" a one-command operation.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Define a <span class="g" data-term="backup">backup</span> = data files + binlog position.</li>
+          <li>Tell apart builtin and xtrabackup engines.</li>
+          <li>Restore a tablet from a backup in the local example.</li>
+          <li>Use vtbackup to take a backup without involving a production tablet.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>The design idea</h2>
+      <ul>
+        <li>A backup = a snapshot of mysqld's data dir + a binlog position.</li>
+        <li>Restore = unpack the snapshot, replay binlogs from the position to "now".</li>
+        <li>Same path used for: disaster recovery, scaling out new replicas, vtbackup workflows.</li>
+      </ul>
+      <p>Vitess decouples <strong>backup engines</strong> (how to capture) from <strong>backup storage</strong> (where to put bytes).</p>
+    </section>
+
+    <section>
+      <h2>Two engines</h2>
+      <table>
+        <tr><th>Engine</th><th>How it works</th><th>Trade-off</th></tr>
+        <tr><td><code>builtin</code></td><td>Stop replica, copy files, restart</td><td>Simpler; mysqld pause during backup</td></tr>
+        <tr><td><code>xtrabackup</code></td><td>Wraps Percona XtraBackup</td><td>Hot — no replica pause; needs external binary</td></tr>
+      </table>
+      <p>Pick via flag <code>--backup_engine_implementation</code>.</p>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/builtinbackupengine.go</span></span></li>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/xtrabackupengine.go</span></span> (if present in your tree)</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Storage backends</h2>
+      <ul>
+        <li><strong>file</strong> — local disk / NFS. <span class="code-cite"><span class="file">filebackupstorage/</span></span></li>
+        <li><strong>gcs</strong> — Google Cloud Storage. <span class="code-cite"><span class="file">gcsbackupstorage/</span></span></li>
+        <li><strong>s3</strong> — implied via S3-compatible</li>
+        <li><strong>azblob</strong> — Azure. <span class="code-cite"><span class="file">azblobbackupstorage/</span></span></li>
+        <li><strong>ceph</strong> — S3-compatible Ceph. <span class="code-cite"><span class="file">cephbackupstorage/</span></span></li>
+      </ul>
+      <p>All under <span class="code-cite"><span class="file">go/vt/mysqlctl/backupstorage/</span></span>.</p>
+    </section>
+
+    <section>
+      <h2>The interface</h2>
+      <pre><code class="language-go">// abridged from go/vt/mysqlctl/backupstorage/interface.go
+type BackupStorage interface {
+    ListBackups(ctx context.Context, dir string) ([]BackupHandle, error)
+    StartBackup(ctx context.Context, dir, name string) (BackupHandle, error)
+    RemoveBackup(ctx context.Context, dir, name string) error
+    Close() error
+}
+
+type BackupHandle interface {
+    Directory() string
+    Name() string
+    AddFile(ctx context.Context, filename string, size int64) (io.WriteCloser, error)
+    ReadFile(ctx context.Context, filename string) (io.ReadCloser, error)
+    EndBackup(ctx context.Context) error
+    AbortBackup(ctx context.Context) error
+}</code></pre>
+      <p>It's just a streaming file API + atomic "this backup is done".</p>
+    </section>
+
+    <section>
+      <h2>Taking a backup</h2>
+      <pre><code class="language-bash">vtctldclient Backup &lt;tablet-alias&gt;
+# or
+./401_backup.sh   # in the local example</code></pre>
+      <ol>
+        <li>vtctld → tablet manager <code>Backup</code> RPC.</li>
+        <li>Tablet sets itself NOT_SERVING (or uses RDONLY to avoid impact).</li>
+        <li>Stops replication.</li>
+        <li>Backup engine streams files into storage handle.</li>
+        <li>Closes handle (atomic commit).</li>
+        <li>Restarts replication; reverts state.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Restoring</h2>
+      <ul>
+        <li>vttablet on first start with empty data dir detects "I should be a tablet".</li>
+        <li>Calls <code>RestoreFromBackup</code> RPC on itself.</li>
+        <li>List backups → pick most recent compatible one.</li>
+        <li>Stream files into data dir.</li>
+        <li>Start mysqld.</li>
+        <li>Set up replication; wait for catch-up.</li>
+        <li>Mark tablet healthy.</li>
+      </ul>
+      <p>End result: a fresh, in-sync replica from a single restart. This is the magic.</p>
+    </section>
+
+    <section>
+      <h2>Point-in-time recovery (PITR)</h2>
+      <ul>
+        <li>Beyond plain restore: replay binlogs to a specific time.</li>
+        <li><code>RestoreFromBackup --restore-to-pos &lt;gtid&gt;</code> or <code>--restore-to-timestamp &lt;ts&gt;</code></li>
+        <li>Binlogs need to be archived separately (Vitess has options to back them up too).</li>
+        <li>Use case: "we deployed a bug at 14:32 that ran <code>DELETE FROM users</code>; restore to 14:31".</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>vtbackup: the standalone snapper</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/cmd/vtbackup/</span></span> — single-purpose binary.</li>
+        <li>Cron / K8s job:
+          <ol>
+            <li>Spin up an isolated mysqld.</li>
+            <li>Restore latest backup.</li>
+            <li>Replicate to "now".</li>
+            <li>Take a new backup.</li>
+            <li>Exit.</li>
+          </ol>
+        </li>
+        <li>No production tablet is impacted. Common pattern in operator-deployed clusters.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Compression &amp; encryption</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/compression.go</span></span> — pluggable: gzip, zstd, external command.</li>
+        <li>Compression often pays back massively for filesystem data (InnoDB ibd files).</li>
+        <li>Encryption at rest is the storage backend's responsibility (GCS / S3 server-side).</li>
+        <li>Encryption in transit handled by storage SDKs (HTTPS).</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Manifest &amp; metadata</h2>
+      <ul>
+        <li>Every backup includes a manifest JSON describing: backup time, position, files, hashes.</li>
+        <li><code>vtctldclient GetBackups commerce/0</code> lists them.</li>
+        <li>vttablet picks backups by name (timestamp) but also reads the manifest to confirm compatibility.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">30-min lab</div>
+        <ol>
+          <li>Run <code>./401_backup.sh</code>; check <code>$VTDATAROOT/backups/</code></li>
+          <li><code>vtctldclient GetBackups commerce/0</code></li>
+          <li>Stop a replica tablet, blow away its data dir, restart with <code>vttablet ... --restore_from_backup</code>.</li>
+          <li>Watch it download, replay, come up healthy. (The local example's <code>403_restore_from_backup.sh</code> does this dance.)</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap of Part V</h2>
+      <ul>
+        <li>Sharding: keyspace ID + vindex + keyranges. Topology in vschema.</li>
+        <li>VReplication: tail binlog, transform, apply. Used everywhere.</li>
+        <li>MoveTables &amp; Reshard: workflow over VReplication, with cutover.</li>
+        <li>Online DDL: shadow table + VReplication + rename swap.</li>
+        <li>Throttler: gates background work on production lag.</li>
+        <li>Backups: standardized restore = automatic replica recovery.</li>
+      </ul>
+      <p>Part VI: how to actually contribute.</p>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Restoring a fresh replica involves two steps. Name them.</div>
+        <details><summary>Reveal</summary><div class="quiz-a">(1) Download the latest backup, unpack into the data dir. (2) Start mysqld and let it replicate from the current primary to catch up. The catchup step is just normal MySQL replication.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Why is vtbackup useful in Kubernetes deployments?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">A Kubernetes CronJob can run vtbackup periodically: it boots a one-off mysqld, restores latest backup, catches up, takes a new backup, exits. No production tablet is impacted.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap of Part V</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Map column → keyspace ID → shard using a vindex.</li>
+          <li>Trace a VReplication workflow's lifecycle.</li>
+          <li>Submit and monitor an online DDL.</li>
+          <li>Tune the throttler.</li>
+          <li>Take and restore backups.</li>
+        </ul>
+      </div>
+      <p>Part VI: how to contribute back.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/backup.go</span></span></li>
+        <li><a href="https://vitess.io/docs/user-guides/backup-and-restore/" target="_blank">Vitess docs · backups</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 21 · VReplication Internals</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="21" data-title="VReplication Internals" data-part="Part V — Sharding &amp; VReplication" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part V · Chapter 26</div>
+      <h1>VReplication.</h1>
+      <p class="subtitle">The "tail a binlog and apply it somewhere else" engine that powers MoveTables, Reshard, and Materialize. Once you grok this, you grok 60% of Vitess's hard problems.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Describe VReplication in one sentence: "tail one tablet's binlog, transform rows, apply on another."</li>
+          <li>Tell apart the copy phase and the running (catchup) phase.</li>
+          <li>Read the <code>_vt.vreplication</code> table on your local cluster.</li>
+          <li>Know that <span class="g" data-term="movetables">MoveTables</span>, <span class="g" data-term="reshard">Reshard</span>, Materialize, and Online DDL all share this engine.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>One sentence definition</h2>
+      <blockquote>
+        VReplication is a per-vttablet engine that follows another tablet's binlog, filters/transforms each row, and applies the result on its own mysqld.
+      </blockquote>
+      <ul>
+        <li>Source = some tablet (often RDONLY) somewhere in the cluster.</li>
+        <li>Target = the local vttablet's mysqld.</li>
+        <li>Filter = a SQL expression that decides which rows match.</li>
+        <li>Bookkeeping in <code>_vt.vreplication</code> on the target.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Why one engine for so many things</h2>
+      <ul>
+        <li><strong>MoveTables</strong> — copy a few tables from keyspace A to keyspace B.</li>
+        <li><strong>Reshard</strong> — copy rows from old shards to new shards (matched by vindex).</li>
+        <li><strong>Materialize</strong> — keep a derived table up to date via a SQL transform.</li>
+        <li><strong>OnlineDDL via VReplication</strong> — copy rows from old table schema to new, applying schema changes.</li>
+        <li>Same primitive every time: <em>follow a binlog, transform, apply</em>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Architecture</h2>
+      <div class="mermaid">
+flowchart LR
+    Source[(source tablet<br/>mysqld)] -->|VStream<br/>binlog dump| Replicator[VReplicator<br/>on target]
+    subgraph TargetTablet [target vttablet]
+        Engine[VReplication Engine] --> Replicator
+        Replicator --> Plan[Replicator Plan]
+        Plan --> Apply[Apply changes]
+    end
+    Apply --> Target[(target mysqld)]
+    Apply --> State[_vt.vreplication<br/>position, state]
+      </div>
+    </section>
+
+    <section>
+      <h2>The engine</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletmanager/vreplication/engine.go</span></span> — top-level <code>Engine</code> struct.</li>
+        <li>On startup, reads <code>_vt.vreplication</code>; for each row, spawns a <code>controller</code> goroutine.</li>
+        <li>Each controller manages one workflow on this target.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The controller</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">controller.go</span></span> + <span class="code-cite"><span class="file">controller_plan.go</span></span></li>
+        <li>Two phases:
+          <ol>
+            <li><strong>Copy phase</strong> — initial bulk copy of existing rows (<code>vcopier.go</code>)</li>
+            <li><strong>Catchup/Running phase</strong> — tail binlog and apply (<code>vplayer.go</code>)</li>
+          </ol>
+        </li>
+        <li>Records position in <code>_vt.vreplication.pos</code> as a GTID set.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The copy phase</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">vcopier.go</span></span> (and <code>vcopier_atomic.go</code>).</li>
+        <li>For each table in the workflow:
+          <ol>
+            <li>SELECT rows from source in chunks, ordered by PK.</li>
+            <li>INSERT them on target.</li>
+            <li>Track "last PK copied" in <code>_vt.copy_state</code>.</li>
+          </ol>
+        </li>
+        <li>While copying, the binlog event stream is buffered/replayed for the already-copied range so target stays consistent.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The running phase</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">vplayer.go</span></span></li>
+        <li>Opens a binlog stream on the source at the current position.</li>
+        <li>For each row event:
+          <ol>
+            <li>Check filter (vschema/keyspace ID match).</li>
+            <li>Transform values if needed.</li>
+            <li>Build SQL: INSERT / UPDATE / DELETE on target.</li>
+            <li>Apply, update position.</li>
+          </ol>
+        </li>
+        <li>Throttler (<span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/throttle/</span></span>) gates work so it doesn't drown the source/target.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The replicator plan</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">replicator_plan.go</span></span>, <span class="code-cite"><span class="file">table_plan_builder.go</span></span></li>
+        <li>Pre-computed: for each table, how to translate "source row → target row".</li>
+        <li>Handles: column renames, expression projections, filter <code>WHERE</code>, vindex match for resharding.</li>
+        <li>The plan is built once when the workflow starts; row events are cheap to apply.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>VStream — the read side</h2>
+      <ul>
+        <li>The source tablet exposes a <strong>VStream</strong> RPC.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/binlog_dump_engine.go</span></span> — server side.</li>
+        <li>VStream events: <code>BEGIN</code>, <code>FIELD</code>, <code>ROW</code>, <code>GTID</code>, <code>COMMIT</code>.</li>
+        <li>Higher-level than raw binlog events — schema is already attached.</li>
+      </ul>
+      <p>Other things consume VStream too: vtgate's <code>VStream</code> API, third-party CDC.</p>
+    </section>
+
+    <section>
+      <h2>The state table: <code>_vt.vreplication</code></h2>
+      <pre><code class="language-sql">SELECT id, workflow, state, pos, source FROM _vt.vreplication\G</code></pre>
+      <p>One row per active VReplication stream on this tablet. <code>state</code> is one of:</p>
+      <ul>
+        <li><code>Init</code> — not yet started</li>
+        <li><code>Copying</code> — initial copy in progress</li>
+        <li><code>Running</code> — tailing binlog</li>
+        <li><code>Stopped</code> — paused (often by error)</li>
+        <li><code>Lagging</code> — falling behind</li>
+        <li><code>Error</code> — see the <code>message</code> column</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>RPCs that drive workflows</h2>
+      <ul>
+        <li>Defined in <span class="code-cite"><span class="file">rpc_vreplication.go</span></span>:
+          <ul>
+            <li><code>CreateVReplicationWorkflow</code></li>
+            <li><code>ReadVReplicationWorkflow</code></li>
+            <li><code>UpdateVReplicationWorkflow</code> — pause / resume / change source</li>
+            <li><code>DeleteVReplicationWorkflow</code></li>
+          </ul>
+        </li>
+        <li>vtctldclient surfaces these via higher-level <code>MoveTables create / show / cancel / complete</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>VDiff: the verifier</h2>
+      <ul>
+        <li>Before cutting over, you want "are source and target equal?".</li>
+        <li>vdiff streams rows from both sides in PK order; compares.</li>
+        <li>Reports mismatches; never modifies.</li>
+        <li>Code: <span class="code-cite"><span class="file">go/vt/vttablet/tabletmanager/vdiff/</span></span></li>
+      </ul>
+      <p><strong>Always vdiff before SwitchTraffic.</strong> It's the safety net.</p>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">30-min, hands-on</div>
+        With local cluster up:
+        <ol>
+          <li>Run <code>./202_move_tables.sh</code> — kicks off a MoveTables workflow.</li>
+          <li>On the <em>target</em> tablet, query <code>_vt.vreplication</code>. See the row appear.</li>
+          <li>Watch its <code>pos</code> advance as you insert data on the source.</li>
+          <li>Run <code>vtctldclient vdiff --workflow commerce2customer --target-keyspace customer create</code>; <code>show last</code>.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. What's the difference between the copy phase and the running phase?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Copy: bulk select-from-source-and-insert-to-target, ordered by PK, in chunks. Running: tail the source's binlog and apply each event. After copy, the engine seamlessly switches to running mode at the captured GTID.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. The same VReplication engine powers MoveTables, Reshard, Materialize, and Online DDL. What's different about each?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">The filter and target — MoveTables copies whole tables to another keyspace; Reshard filters by keyrange; Materialize applies a SQL transform; Online DDL writes to a shadow table with new schema. Engine doesn't care; it's just rows in, rows out.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Why is the throttler important here?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">VReplication runs in the background. If it overwhelms the source/target mysqlds, real production traffic suffers. The throttler tells VReplication to back off when replication lag rises on the primary's replicas.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Describe VReplication in one sentence.</li>
+          <li>Inspect <code>_vt.vreplication</code> on a target tablet.</li>
+          <li>Recognize that all data-movement workflows share this engine.</li>
+        </ul>
+      </div>
+      <p>Next: how MoveTables and Reshard <em>orchestrate</em> VReplication into a workflow.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletmanager/vreplication/</span></span> — read <code>engine.go</code>, then <code>controller.go</code>, then <code>vcopier.go</code>, then <code>vplayer.go</code></li>
+        <li><a href="https://vitess.io/docs/concepts/vreplication/" target="_blank">Vitess docs · vreplication</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 02 · What Problem Vitess Solves</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="02" data-title="What Problem Vitess Solves" data-part="Part I — MySQL from a Code Perspective" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part I · Chapter 7</div>
+      <h1>Why Vitess exists.</h1>
+      <p class="subtitle">A single MySQL server can absolutely run your startup. The trouble starts when you outgrow it — and that's a much harder problem than it sounds.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Describe the four ways MySQL stops scaling (writes, storage, ops, schema).</li>
+          <li>Compare the "obvious" scaling alternatives and what each costs.</li>
+          <li>Sketch <span class="g" data-term="vitess">Vitess</span>'s shape (apps → vtgate → vttablet → mysqld) on a napkin.</li>
+          <li>Decide when Vitess is and isn't worth it.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>The problem in one sentence</h2>
+      <blockquote>
+        <em>"I want MySQL semantics, but I want my data to be 100&times; bigger and my traffic 1000&times; higher than one machine can handle."</em>
+      </blockquote>
+      <ul>
+        <li>MySQL on one box: rock solid, well understood, decades of tooling.</li>
+        <li>MySQL on a thousand boxes: who owns failover? who routes queries? who reshards live data?</li>
+        <li>Vitess is the answer to those <em>who</em>s — without making you rewrite your app to use a different database.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>How big does Vitess scale?</h2>
+      <ul>
+        <li>Built at YouTube starting 2011 — eventually <strong>tens of thousands</strong> of MySQL instances.</li>
+        <li>Now in production at Slack, Block (Square), GitHub, Shopify, JD.com, etc.</li>
+        <li>Slack famously moved their entire database tier to Vitess.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Don't confuse "big" with "needed"</div>
+        Most apps will never reach Vitess scale. Vitess is interesting <em>because</em> it solves a problem you probably don't have — yet. Learning it teaches you a lot about distributed databases regardless.
+      </div>
+    </section>
+
+    <section>
+      <h2>What "doesn't scale" means in MySQL</h2>
+      <ul>
+        <li><strong>Write throughput</strong> — one primary takes all writes. Replicas help reads, not writes.</li>
+        <li><strong>Storage</strong> — eventually the working set exceeds RAM and indexes blow past disk.</li>
+        <li><strong>Operational blast radius</strong> — when "the database" is one machine, every cron job, ALTER, backup, etc. fights everyone else.</li>
+        <li><strong>Schema changes</strong> — running <code>ALTER TABLE</code> on a multi-TB table is downtime.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The "obvious" solutions and their costs</h2>
+      <table>
+        <tr><th>Solution</th><th>Buys you</th><th>Costs you</th></tr>
+        <tr><td>Bigger hardware</td><td>Time</td><td>Money; eventually no bigger box exists</td></tr>
+        <tr><td>Read replicas</td><td>Read scale</td><td>Replica lag; still one write primary</td></tr>
+        <tr><td>App-level sharding</td><td>Write scale</td><td>App now has to do cross-shard joins, txns, rebalancing</td></tr>
+        <tr><td>Move to NoSQL</td><td>Scale</td><td>Lose SQL, lose joins, lose transactions</td></tr>
+        <tr><td>Use Vitess</td><td>SQL + scale</td><td>Complexity; this tutorial</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>The Vitess core idea</h2>
+      <div class="mermaid">
+flowchart LR
+    App[Your App] -->|MySQL wire protocol| VTGate[vtgate<br/>query router]
+    VTGate -->|gRPC| VTTablet1[vttablet]
+    VTGate -->|gRPC| VTTablet2[vttablet]
+    VTGate -->|gRPC| VTTabletN[vttablet]
+    VTTablet1 --> MySQL1[(mysqld<br/>shard 1)]
+    VTTablet2 --> MySQL2[(mysqld<br/>shard 2)]
+    VTTabletN --> MySQLN[(mysqld<br/>shard N)]
+      </div>
+      <ul>
+        <li>App still speaks plain MySQL. Vitess pretends to be one big MySQL.</li>
+        <li>Behind the curtain: many real MySQLs, each owning a slice of the data.</li>
+        <li>Routing, failover, reshards, online schema migrations — all handled for you.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>What Vitess gives you</h2>
+      <ul>
+        <li><strong>Sharding without app changes.</strong> Your app issues normal SQL; Vitess figures out which shard(s) to hit.</li>
+        <li><strong>Cross-shard queries.</strong> Joins, aggregates, scatter-gather all happen for you (within limits).</li>
+        <li><strong>Online resharding.</strong> Split or merge shards while traffic flows. No write downtime.</li>
+        <li><strong>Online DDL.</strong> ALTER TABLE on huge tables, no downtime.</li>
+        <li><strong>Automatic failover.</strong> VTOrc watches replication; promotes a new primary on failure.</li>
+        <li><strong>Workflow tooling.</strong> MoveTables, materialize, vdiff, backups, audits.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>What Vitess costs you</h2>
+      <ul>
+        <li><strong>Operational complexity.</strong> You now run vtgate, vttablet, vtctld, vtorc, a topo service, plus the MySQLs.</li>
+        <li><strong>Query restrictions.</strong> Not every SQL feature works the same — joins across shards have rules, transactions across shards need 2PC.</li>
+        <li><strong>Mental load.</strong> Sharding-by-key is a one-way commit. Pick the wrong key, pay the cost.</li>
+        <li><strong>This tutorial.</strong> ~8 hours just to understand it.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">When NOT to use Vitess</div>
+        Less than ~1TB working set, less than ~10k QPS, no plans to scale 10&times;? You almost certainly don't need it. Use plain MySQL and replicas, profile, optimize.
+      </div>
+    </section>
+
+    <section>
+      <h2>The four pillars (preview of Parts III-V)</h2>
+      <div class="cols">
+        <div>
+          <h3>vtgate</h3>
+          <p>Stateless proxy. Parses SQL, plans, routes to the right shard(s), aggregates results.</p>
+          <h3>vttablet</h3>
+          <p>Sits in front of each mysqld. Query rewriting, connection pool, schema, transactions, replication health.</p>
+        </div>
+        <div>
+          <h3>vtctld / vtctldclient</h3>
+          <p>The control plane: cluster admin commands, workflows.</p>
+          <h3>topo</h3>
+          <p>Configuration store (etcd, ZK, consul). Where shards, tablets, vschema live.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">10-minute exercise</div>
+        Skim the local example to see Vitess in action — don't run it yet, just read:
+        <ol>
+          <li><code>cat examples/local/README.md</code></li>
+          <li><code>cat examples/local/101_initial_cluster.sh</code></li>
+        </ol>
+        Count how many processes the cluster starts (etcd, vtctld, vttablets, vtgate, vtorc). That's the minimum Vitess deployment.
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Vitess sits in front of "real" MySQLs. What does that imply about the data format on disk?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">It's vanilla InnoDB on disk. Any DBA who knows MySQL can debug a Vitess shard at the mysqld level. That's a deliberate design choice — it preserves 25 years of MySQL tooling.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. What's the single biggest <em>cost</em> of using Vitess?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Operational complexity. You now run 5+ kinds of process (vtgate, vttablet, vtctld, vtorc, topo) plus the MySQLs. If you don't actually need scaling, this is overhead for no payoff.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Name two things that change once your transaction touches more than one shard.</div>
+        <details><summary>Reveal</summary><div class="quiz-a">(a) Default semantics become per-shard atomic, not globally atomic — you can have a partial commit. (b) Joins across shards are coordinated by vtgate at extra cost. Many apps choose a shard key that keeps related rows together to avoid both.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Explain in one sentence why Vitess exists.</li>
+          <li>Decide whether your project actually needs Vitess.</li>
+          <li>Name the five process kinds and what each does, even if at a slogan level.</li>
+        </ul>
+      </div>
+      <p>Next: MySQL architecture. We can't read Vitess source without it.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><a href="https://vitess.io/docs/overview/" target="_blank">Vitess docs · overview</a></li>
+        <li><a href="https://vitess.io/docs/overview/architecture/" target="_blank">Architecture overview (operator-facing)</a></li>
+        <li>"<a href="https://vitess.io/blog/2020-04-01-monolith-to-cells-slack/" target="_blank">From monolith to cells</a>" — Slack's blog on adopting Vitess</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

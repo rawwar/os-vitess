@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 14 · Semantic Analysis &amp; Gen4 Planner</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="14" data-title="Semantic Analysis &amp; Gen4 Planner" data-part="Part III — vtgate: The Query Router" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part III · Chapter 19</div>
+      <h1>From AST to plan.</h1>
+      <p class="subtitle">The <span class="g" data-term="planner">planner</span> is the most algorithmic part of Vitess. We won't read it line-by-line — that's months. We'll get the shape right and find your way around.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Name the 5 pipeline stages: semantics → operator tree → physical plan → primitives → cache.</li>
+          <li>Predict, for a given <code>WHERE</code> clause, whether the planner picks <code>EqualUnique</code>, <code>IN</code>, or <code>Scatter</code>.</li>
+          <li>Use <code>VEXPLAIN PLAN</code> on your local cluster to see plans.</li>
+          <li>Find a <code>testdata/*.json</code> file under <code>planbuilder/</code> and add a new case to it.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Our running example, planned</h2>
+      <p><code>SELECT c.customer_id, c.email FROM customer c WHERE c.customer_id = 42</code></p>
+      <p>Because <code>customer</code> is sharded by <code>customer_id</code> with a hash vindex, and the predicate is <code>customer_id = 42</code> (unique vindex match), the planner short-circuits via the "single-sharded shortcut":</p>
+<pre><code class="language-text">Plan:
+  Route {
+    Opcode:   EqualUnique
+    Keyspace: customer
+    Vindex:   hash
+    Values:   [42]
+    Query:    "select c.customer_id, c.email from customer as c where c.customer_id = :vtg1"
+  }</code></pre>
+      <p>One shard touched. No join, no aggregation, no scatter. This is the fast path most OLTP traffic takes.</p>
+    </section>
+
+    <section>
+      <h2>What the planner produces</h2>
+      <p>An <code>engine.Plan</code>: a tree of <em>primitives</em> from <code>go/vt/vtgate/engine/</code>.</p>
+      <ul>
+        <li><code>Route</code> — send a query to one or more shards</li>
+        <li><code>Join</code>, <code>HashJoin</code> — combine results from two children</li>
+        <li><code>Aggregate</code>, <code>OrderedAggregate</code>, <code>ScalarAggregate</code> — group/sum/min/max</li>
+        <li><code>Limit</code>, <code>Filter</code>, <code>Projection</code>, <code>Distinct</code></li>
+        <li><code>Concatenate</code> — UNION</li>
+        <li><code>InsertSelect</code>, <code>Update</code>, <code>Delete</code></li>
+        <li>… and ~30 more</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The five-step pipeline</h2>
+      <div class="mermaid">
+flowchart LR
+    AST[AST<br/>from sqlparser] --> Sem[semantic<br/>analysis]
+    Sem --> Op[Operator tree<br/>logical plan]
+    Op --> Phys[Physical plan<br/>cost-based pick]
+    Phys --> Prim[Engine primitives]
+    Prim --> Cache[Plan cache]
+      </div>
+      <ol>
+        <li><strong>Semantic analysis</strong> — resolve names, scopes, types</li>
+        <li><strong>Operator tree</strong> — a logical, sharding-aware tree</li>
+        <li><strong>Physical planning</strong> — push filters down, pick joins</li>
+        <li><strong>Primitive generation</strong> — convert to <code>engine.Plan</code></li>
+        <li><strong>Cache</strong> — keyed by SQL + vschema version</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Semantic analysis</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/semantics/</span></span> — its own package.</li>
+        <li><strong>SemTable</strong>: column → table mapping, type info, scope tree.</li>
+        <li>Catches "column X is ambiguous", "no such table", type mismatches before planning.</li>
+        <li>The output feeds the planner with "for this <code>*ColName</code> AST node, here's exactly which table column it refers to".</li>
+      </ul>
+      <pre><code class="language-go">semTable, err := semantics.Analyze(stmt, currentDB, vschema)</code></pre>
+    </section>
+
+    <section>
+      <h2>Operator tree</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/planbuilder/operators/</span></span> — operator definitions.</li>
+        <li><code>Route</code>, <code>Join</code>, <code>Filter</code>, <code>Projection</code>, <code>Aggregator</code>, <code>Limit</code>, etc.</li>
+        <li>Functional/algebraic-style — each operator can be rewritten by passes.</li>
+        <li>Rules apply: predicate pushdown, constant folding, dedup, cross-keyspace boundary checks.</li>
+      </ul>
+      <p>The operator tree is where the cleverness lives.</p>
+    </section>
+
+    <section>
+      <h2>Physical planning</h2>
+      <ul>
+        <li>Decide: which join algorithm? scatter or single-route? do we need an aggregator on vtgate or push it to the shard?</li>
+        <li>Lower-cost wins. Cost = approximate: scatter > single-shard, MemoryTable > Sort, etc.</li>
+        <li>The "Gen4" planner is the current generation (Gen3, the older one, was retired in v17/18).</li>
+      </ul>
+      <p>See <span class="code-cite"><span class="file">go/vt/vtgate/planbuilder/operator_transformers.go</span></span> — operator → engine primitive.</p>
+    </section>
+
+    <section>
+      <h2>Plans by statement type</h2>
+      <table>
+        <tr><th>Statement</th><th>Builder file</th></tr>
+        <tr><td>SELECT</td><td><code>select.go</code></td></tr>
+        <tr><td>INSERT</td><td><code>insert.go</code></td></tr>
+        <tr><td>UPDATE</td><td><code>update.go</code></td></tr>
+        <tr><td>DELETE</td><td><code>delete.go</code></td></tr>
+        <tr><td>DDL</td><td><code>ddl.go</code></td></tr>
+        <tr><td>SET</td><td><code>set.go</code></td></tr>
+        <tr><td>SHOW</td><td><code>show.go</code></td></tr>
+        <tr><td>SELECT … FOR UPDATE</td><td><code>locktables.go</code></td></tr>
+        <tr><td>routed cross-keyspace</td><td><code>route.go</code> + <code>operators/</code></td></tr>
+      </table>
+      <p>All in <code>go/vt/vtgate/planbuilder/</code>.</p>
+    </section>
+
+    <section>
+      <h2>The "single-sharded shortcut"</h2>
+      <ul>
+        <li>If the planner can prove the query touches a single shard, it short-circuits — emits one <code>Route</code> and skips most analysis.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/planbuilder/single_sharded_shortcut.go</span></span></li>
+        <li>Huge perf win for routine OLTP — most queries hit just one shard.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The plan cache</h2>
+      <ul>
+        <li>Plans are expensive to build; identical SQL is cheap to re-run.</li>
+        <li>Cache key: normalized SQL + vschema version + a few session bits.</li>
+        <li>LRU bounded by size (memory accounting via the generated <code>cached_size.go</code> files).</li>
+        <li><span class="code-cite"><span class="file">go/cache/theine/</span></span> — TheineW cache impl.</li>
+        <li>Expose at <code>/debug/query_plans</code> on vtgate.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Plan tests: the gift that keeps giving</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/planbuilder/testdata/</span></span> — hundreds of JSON files.</li>
+        <li>Each pair: SQL in, expected plan out.</li>
+        <li>To debug a planner bug: add the failing SQL, run <code>plan_test.go</code>, see the diff.</li>
+        <li>Best place to learn what the planner is supposed to produce.</li>
+      </ul>
+      <div class="callout success">
+        <div class="callout-title">Open one</div>
+        <code>ls go/vt/vtgate/planbuilder/testdata/ | head -20</code> — try <code>select_cases.json</code>. Each entry shows you the AST → plan mapping in plain text.
+      </div>
+    </section>
+
+    <section>
+      <h2>vexplain: see plans live</h2>
+      <pre><code class="language-sql">VEXPLAIN PLAN SELECT * FROM customer WHERE id = 42;
+VEXPLAIN QUERIES SELECT * FROM customer WHERE id = 42;
+VEXPLAIN ALL SELECT * FROM customer WHERE id = 42;</code></pre>
+      <ul>
+        <li><code>PLAN</code> — the high-level plan tree</li>
+        <li><code>QUERIES</code> — what gets sent to each tablet</li>
+        <li><code>ALL</code> — both, plus execution stats</li>
+      </ul>
+      <p>Run from any MySQL client connected to vtgate. Indispensable.</p>
+    </section>
+
+    <section>
+      <h2>Cross-keyspace queries</h2>
+      <ul>
+        <li>Joining tables from two different keyspaces? You need the planner to know about both vschemas.</li>
+        <li>vtgate config flag <code>NoCrossKeyspaceJoins</code> (zero-value preserves old behavior — see CLAUDE.md note on negative-polarity bools).</li>
+        <li>The operator-tree pass <em>checks</em> if a join can cross keyspaces.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">30-min deep dive</div>
+        <ol>
+          <li><code>cat go/vt/vtgate/planbuilder/testdata/select_cases.json | head -200</code> — see a few plans</li>
+          <li>From your local vtgate: <code>VEXPLAIN ALL SELECT * FROM customer JOIN corder ON customer.customer_id = corder.customer_id;</code></li>
+          <li>Read <span class="code-cite"><span class="file">go/vt/vtgate/planbuilder/planner.go</span></span> · <code>BuildFromStmt</code> top-down</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. <code>SELECT * FROM customer WHERE email = 'a@x.com'</code> on a keyspace sharded by <code>customer_id</code>: what does the planner produce?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Without a secondary lookup vindex on <code>email</code>, this is a <strong>Scatter</strong> — vtgate sends the query to every shard, dedupes results. With a lookup vindex on <code>email</code>, it becomes an EqualUnique route to one shard.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Why does <code>SELECT AVG(x)</code> across shards need a special trick?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">You can't average partial averages directly. The planner asks each shard for <code>SUM(x)</code> and <code>COUNT(x)</code>, then divides at vtgate. <code>SUM</code> and <code>COUNT</code> compose; <code>AVG</code> doesn't.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Why is the plan cache keyed on normalized SQL + vschema version?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Normalized SQL means literals (42, 99) became bind vars, so all "where id = N" queries share one plan. vschema version means: if sharding rules change, old plans are invalidated automatically.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Trace AST → operator tree → plan in one sketch.</li>
+          <li>Predict the route opcode from a WHERE clause + vschema.</li>
+          <li>Use <code>VEXPLAIN</code> on your local cluster to inspect plans.</li>
+          <li>Find the right <code>testdata/*.json</code> when a planner test breaks.</li>
+        </ul>
+      </div>
+      <p>Next: how plans actually run.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/planbuilder/</span></span> — package-level doc-comment in <code>planner.go</code></li>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/semantics/</span></span> — semantic analysis</li>
+        <li>"Gen4 planner" blog posts on vitess.io</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

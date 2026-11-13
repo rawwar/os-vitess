@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 09 · Building &amp; Running Vitess Locally</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="09" data-title="Building &amp; Running Vitess Locally" data-part="Part II — Vitess at a Glance" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part II · Chapter 14</div>
+      <h1>From source to a running cluster.</h1>
+      <p class="subtitle">No amount of reading replaces running it yourself. By the end of this chapter you'll have a real Vitess cluster on your laptop and queried it through <span class="g" data-term="vtgate">vtgate</span>. This is the chapter you'll come back to whenever you want to test an idea.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Have built every Vitess binary from source.</li>
+          <li>Have a 5-tablet local cluster running on your laptop.</li>
+          <li>Have queried it through vtgate as if it were plain MySQL.</li>
+          <li>Have tailed a vttablet's log while running a query and seen the exact moment your SQL hits mysqld.</li>
+          <li>Know how to tear it all down and start fresh.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Prerequisites</h2>
+      <ul>
+        <li><strong>Go</strong> — version pinned in <code>go.mod</code> (<code>go 1.24</code>+ at time of writing).</li>
+        <li><strong>MySQL or Percona</strong> — Vitess talks to a real mysqld. Install MySQL 8.x from your package manager.</li>
+        <li><strong>etcd</strong> — local example uses etcd as the topo. The bootstrap script provides one.</li>
+        <li><strong>protoc</strong> — only if you'll regenerate protobufs. Skip if you're just building.</li>
+        <li><strong>make</strong>, <strong>bash</strong>, ~3-4 GB free disk.</li>
+      </ul>
+      <p>macOS or Linux. Windows works through WSL only.</p>
+    </section>
+
+    <section>
+      <h2>One-time setup</h2>
+      <pre><code class="language-bash"># From the repo root:
+./bootstrap.sh        # installs proto compiler, dev tools, etcd into vthook/
+source dev.env        # sets VTROOT, VTDATAROOT, PATH, etc.
+make build            # compiles all binaries into bin/</code></pre>
+      <ul>
+        <li><code>bootstrap.sh</code> is idempotent — re-run after a rebase if dev tools change.</li>
+        <li><code>dev.env</code> is sourced into your shell. Re-source after opening a new terminal.</li>
+        <li>Binaries land in <code>bin/</code>. That dir is on <code>PATH</code> via <code>dev.env</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The Makefile is your friend</h2>
+      <table>
+        <tr><th>Target</th><th>What it does</th></tr>
+        <tr><td><code>make build</code></td><td>Compile all binaries</td></tr>
+        <tr><td><code>make install</code></td><td>Install to <code>$VTROOT/bin</code></td></tr>
+        <tr><td><code>make test</code></td><td>Run unit tests (long)</td></tr>
+        <tr><td><code>make unit_test</code></td><td>Unit tests, short flavor</td></tr>
+        <tr><td><code>make proto</code></td><td>Regenerate Go from <code>proto/*.proto</code></td></tr>
+        <tr><td><code>make codegen</code></td><td>Regenerate <em>all</em> generated code (sqlparser AST walkers, cached_size, …)</td></tr>
+        <tr><td><code>make lint</code></td><td>golangci-lint</td></tr>
+        <tr><td><code>make tools</code></td><td>Install Go-based dev tools</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>The local example: top to bottom</h2>
+      <pre><code class="language-bash">cd examples/local
+source ../common/env.sh
+./101_initial_cluster.sh</code></pre>
+      <p>That single script:</p>
+      <ol>
+        <li>Starts <strong>etcd</strong> as the topo service.</li>
+        <li>Starts <strong>vtctld</strong>.</li>
+        <li>Starts five <strong>vttablets</strong> (one primary + replicas for the <code>commerce</code> keyspace).</li>
+        <li>Initializes the keyspace schema.</li>
+        <li>Starts <strong>vtgate</strong>.</li>
+        <li>Starts <strong>vtorc</strong>.</li>
+      </ol>
+      <p>You now have a cluster on localhost. <code>mysql -h 127.0.0.1 -P 15306</code> connects to vtgate.</p>
+    </section>
+
+    <section>
+      <h2>What's running</h2>
+      <pre><code class="language-bash">ps aux | grep -E 'etcd|vt(gate|tablet|ctld|orc)'
+# you'll see:
+#   etcd (topo)
+#   vtctld
+#   vttablet x 5
+#   vtgate
+#   vtorc
+</code></pre>
+      <p>Process logs land in <code>$VTDATAROOT/tmp/</code>. <strong>This is your friend when something is wrong.</strong></p>
+      <div class="callout">
+        <div class="callout-title">Tail a vttablet's log</div>
+        <code>tail -f $VTDATAROOT/tmp/vttablet_*.INFO</code> — watch real RPCs go by while you query vtgate.
+      </div>
+    </section>
+
+    <section>
+      <h2>The scripted progression</h2>
+      <table>
+        <tr><th>Script</th><th>What it demonstrates</th></tr>
+        <tr><td><code>101_initial_cluster.sh</code></td><td>Bring up commerce keyspace</td></tr>
+        <tr><td><code>201_customer_tablets.sh</code></td><td>Add a second (empty) keyspace</td></tr>
+        <tr><td><code>202_move_tables.sh</code></td><td>VReplication: copy <code>customer</code> + <code>corder</code> tables to it</td></tr>
+        <tr><td><code>203_switch_reads.sh</code> / <code>204_switch_writes.sh</code></td><td>Cut traffic over</td></tr>
+        <tr><td><code>301_customer_sharded.sh</code></td><td>Mark customer as sharded by vindex</td></tr>
+        <tr><td><code>302-305</code></td><td>Reshard 1 → 2 shards</td></tr>
+        <tr><td><code>401-403</code></td><td>Backup &amp; restore</td></tr>
+        <tr><td><code>501_teardown.sh</code></td><td>Stop everything, clean state</td></tr>
+      </table>
+      <p>Each script is short (~50-100 lines) and uses <code>vtctldclient</code> primitives. <strong>Read them.</strong></p>
+    </section>
+
+    <section>
+      <h2>Watching code live</h2>
+      <ol>
+        <li>Connect: <code>mysql -h 127.0.0.1 -P 15306</code></li>
+        <li>Run: <code>SELECT * FROM customer;</code></li>
+        <li>In another terminal, tail: <code>tail -f $VTDATAROOT/tmp/vtgate.INFO</code></li>
+        <li>You'll see the query, the chosen plan, the route, the latency.</li>
+      </ol>
+      <div class="callout success">
+        <div class="callout-title">vtgate /debug pages</div>
+        <code>open http://localhost:15001/debug/status</code> (port for vtgate, varies). The web pages expose status, stats, query log, plan cache — invaluable.
+      </div>
+    </section>
+
+    <section>
+      <h2>Lab 1: build everything <span class="slide-badge lab">Lab · 10 min</span></h2>
+      <div class="lab">
+        <div class="lab-title">One-time setup</div>
+        <ol>
+          <li>From the repo root: <pre><code class="language-bash">./bootstrap.sh</code></pre> Installs proto compiler, dev tools, etcd into <code>vthook/</code>. Idempotent.</li>
+          <li><pre><code class="language-bash">source dev.env</code></pre> Sets <code>$VTROOT</code>, <code>$VTDATAROOT</code>, and prepends <code>bin/</code> to <code>$PATH</code>. Re-source per new terminal.</li>
+          <li><pre><code class="language-bash">make build</code></pre> Takes ~2-4 minutes on first build, ~30s after that.</li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">Verify the binaries are there</div>
+<pre class="expected">$ ls bin | head -10
+mysqlctl
+mysqlctld
+vtadmin
+vtbackup
+vtclient
+vtcombo
+vtctl
+vtctld
+vtctldclient
+vtexplain
+</pre>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Lab 2: bring up the cluster <span class="slide-badge lab">Lab · 5 min</span></h2>
+      <div class="lab">
+        <div class="lab-title">Boot the demo</div>
+        <ol>
+          <li><pre><code class="language-bash">cd examples/local
+source ../common/env.sh
+./101_initial_cluster.sh</code></pre></li>
+          <li>Wait ~30 seconds for "successfully initialized". You now have <strong>etcd</strong>, <strong>vtctld</strong>, 5x <strong>vttablet</strong>, <strong>vtgate</strong>, <strong>vtorc</strong>.</li>
+          <li>Confirm processes: <pre><code class="language-bash">ps aux | grep -E '(etcd|vt(gate|tablet|ctld|orc))' | grep -v grep | wc -l</code></pre></li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">Expected — you should see 8 processes</div>
+<pre class="expected">8
+</pre>
+          (1 etcd + 1 vtctld + 5 vttablet + 1 vtgate + 1 vtorc = 8 unique processes)
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Lab 3: query through vtgate <span class="slide-badge lab">Lab · 5 min</span></h2>
+      <div class="lab">
+        <div class="lab-title">Talk to Vitess like it's MySQL</div>
+        <ol>
+          <li>Connect: <pre><code class="language-bash">mysql -h 127.0.0.1 -P 15306 --table</code></pre> Port 15306 is vtgate's MySQL listener. The app thinks it's MySQL.</li>
+          <li>List tablets: <pre><code class="language-sql">SHOW VITESS_TABLETS;</code></pre></li>
+          <li>Look at the commerce keyspace: <pre><code class="language-sql">USE commerce;
+SHOW TABLES;
+SELECT * FROM customer LIMIT 5;</code></pre></li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">Expected (truncated)</div>
+<pre class="expected">+--------------+
+| Tables       |
++--------------+
+| corder       |
+| customer     |
+| product      |
+| ...          |
++--------------+
+</pre>
+        </div>
+        <p style="margin-top: 12px;">Notice you didn't have to know which shard or tablet to talk to. vtgate routed it for you.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Lab 4: watch a query land on a tablet <span class="slide-badge lab">Lab · 10 min</span></h2>
+      <div class="lab">
+        <div class="lab-title">See your SQL hit mysqld</div>
+        <ol>
+          <li>In one terminal, tail a vttablet log: <pre><code class="language-bash">tail -f $VTDATAROOT/tmp/vttablet_0000000100.INFO</code></pre> (Pick any of the <code>vttablet_*.INFO</code> files. <code>0000000100</code> is the first one.)</li>
+          <li>In another terminal, run a query through vtgate: <pre><code class="language-bash">mysql -h127.0.0.1 -P15306 -e "SELECT * FROM commerce.customer LIMIT 3"</code></pre></li>
+          <li>Watch the log scroll. You'll see at least one log line matching your query, with timing.</li>
+          <li>Also try the debug pages: open <a href="http://localhost:15001/debug/status" target="_blank"><code>http://localhost:15001/debug/status</code></a> (vtgate). Then find a vttablet's port from <code>SHOW VITESS_TABLETS</code> and open its <code>/debug/status</code> too.</li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">What to notice</div>
+          <ul>
+            <li>Only one vttablet sees the query — vtgate picked the primary for the keyspace.</li>
+            <li>The <code>/debug/status</code> pages on vtgate and vttablet are gold mines: live stats, recent queries, plan cache, current state.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Lab 5: tear it down <span class="slide-badge lab">Lab · 1 min</span></h2>
+      <div class="lab">
+        <div class="lab-title">Clean state matters</div>
+        <ol>
+          <li><pre><code class="language-bash">./501_teardown.sh</code></pre> Stops every process and removes the <code>$VTDATAROOT</code> tree.</li>
+          <li>Confirm: <pre><code class="language-bash">ps aux | grep -E '(etcd|vt(gate|tablet|ctld|orc))' | grep -v grep</code></pre> should show nothing.</li>
+        </ol>
+        <p style="font-size: 0.85em; color: var(--fg-muted);">
+          You'll re-run <code>./101_initial_cluster.sh</code> dozens of times across this course. The cluster is a scratchpad — feel free to break it.
+        </p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Troubleshooting <span class="slide-badge beginner">Common issues</span></h2>
+      <table class="compare">
+        <tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
+        <tr><td><code>command not found: mysqld</code></td><td>MySQL not installed or not on PATH</td><td>macOS: <code>brew install mysql</code>. Linux: <code>apt install mysql-server</code>.</td></tr>
+        <tr><td><code>address already in use</code> for ports 15306/15001/2379</td><td>Old cluster still up</td><td><code>./501_teardown.sh</code>, then <code>lsof -i :15306</code> to confirm.</td></tr>
+        <tr><td><code>error setting up etcd</code></td><td>Etcd binary missing</td><td>Re-run <code>./bootstrap.sh</code> to re-install it into <code>vthook/</code>.</td></tr>
+        <tr><td>"Schema engine error" on tablet startup</td><td>Stale VTDATAROOT</td><td><code>rm -rf $VTDATAROOT/vt_*</code>, then re-run cluster start.</td></tr>
+        <tr><td>vtorc keeps re-parenting / log spam</td><td>One tablet didn't come up cleanly</td><td>Check that tablet's <code>.INFO</code> log; usually mysqld init failed.</td></tr>
+        <tr><td>"too many open files"</td><td>OS file-descriptor limit too low</td><td><code>ulimit -n 10000</code> in your shell.</td></tr>
+        <tr><td>macOS firewall popup for each binary</td><td>System security</td><td>Allow incoming for each prompt. Or pre-set <code>VTDATAROOT</code> under your home dir to silence them.</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Which port does vtgate listen on for MySQL clients in the local example?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>15306</code>. The <code>15</code> prefix is the convention in the example to avoid clashing with real local MySQLs on 3306.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. After running <code>./101_initial_cluster.sh</code>, how many vttablet processes should be running and why?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Five. The commerce keyspace has one primary tablet and four others (replica + rdonly) for read scaling and failover demos.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. You want to test a code change to vtgate. What's the rebuild-and-restart loop?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>make build</code> → <code>./501_teardown.sh</code> → <code>./101_initial_cluster.sh</code>. Each takes about a minute. There's no live reload — vtgate restarts pick up the new binary from <code>bin/vtgate</code>.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">4. Where do all process logs land?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>$VTDATAROOT/tmp/</code>. Files named like <code>vtgate.INFO</code>, <code>vttablet_0000000100.INFO</code>, etc. Tail them while you debug.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Build Vitess from source and bring up a local cluster.</li>
+          <li>Query it through vtgate as if it were a plain MySQL.</li>
+          <li>Tail any process's log and open its <code>/debug/status</code> page.</li>
+          <li>Tear it down cleanly when something gets weird.</li>
+        </ul>
+      </div>
+      <p>Next: the code conventions and generated files you'll bump into immediately when you start editing.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><a href="https://vitess.io/docs/get-started/local/" target="_blank">Vitess docs · local install</a></li>
+        <li><span class="code-cite"><span class="file">examples/local/README.md</span></span></li>
+        <li><span class="code-cite"><span class="file">examples/common/env.sh</span></span> — what env vars matter</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

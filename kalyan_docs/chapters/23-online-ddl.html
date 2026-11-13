@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 23 · Online DDL &amp; Schema Migrations</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="23" data-title="Online DDL &amp; Schema Migrations" data-part="Part V — Sharding &amp; VReplication" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part V · Chapter 28</div>
+      <h1>ALTER TABLE, without tears.</h1>
+      <p class="subtitle">In big MySQL, an <code>ALTER TABLE</code> on a 1 TB table is an outage. Vitess offers <span class="g" data-term="online-ddl">online DDL</span> strategies that copy rows behind the scenes.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>List the DDL strategies (direct, online/vitess, gh-ost).</li>
+          <li>Trace an online ALTER from submission to completion via <code>_vt.schema_migrations</code>.</li>
+          <li>Cancel a migration mid-run.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Why is ALTER hard?</h2>
+      <ul>
+        <li>MySQL 8's <code>INSTANT</code> and <code>INPLACE</code> work for some operations — but not all (most NOT NULL adds, fulltext, etc.).</li>
+        <li>For the rest, MySQL rewrites the entire table. Locks are minimal, but disk + IO load is huge.</li>
+        <li>On a hot table, replication lag explodes; failovers risk data loss.</li>
+        <li>Vitess provides <strong>strategies</strong> that wrap external tools or do it themselves.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The strategies</h2>
+      <table>
+        <tr><th>Strategy</th><th>How</th></tr>
+        <tr><td><code>direct</code></td><td>Run the ALTER as-is (no online magic)</td></tr>
+        <tr><td><code>online</code> / <code>vitess</code></td><td>Native VReplication-based; default</td></tr>
+        <tr><td><code>gh-ost</code></td><td>Wrap <a href="https://github.com/github/gh-ost">gh-ost</a> per shard</td></tr>
+        <tr><td><code>pt-osc</code></td><td>(historical) Percona's pt-online-schema-change</td></tr>
+      </table>
+      <p>Set via <code>vtctldclient ApplySchema --ddl-strategy="online"</code>.</p>
+    </section>
+
+    <section>
+      <h2>The "online" / "vitess" strategy</h2>
+      <p>Mechanism: a one-off VReplication workflow per shard.</p>
+      <ol>
+        <li>Create a shadow table with the desired schema.</li>
+        <li>VReplication copies + tails source → shadow.</li>
+        <li>vdiff (optional).</li>
+        <li>Cutover: swap table names (atomic-ish).</li>
+        <li>Old table dropped (garbage collection delayed for safety).</li>
+      </ol>
+      <p>You don't see any of this — you get a migration UUID and watch it progress.</p>
+    </section>
+
+    <section>
+      <h2>Where it lives in code</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/schema/ddl_strategy.go</span></span> — parses the strategy spec.</li>
+        <li><span class="code-cite"><span class="file">go/vt/schema/online_ddl.go</span></span> — the OnlineDDL state object.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/onlineddl/executor.go</span></span> — per-tablet executor; the state machine.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/onlineddl/vrepl.go</span></span> — the VReplication-based variant.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/onlineddl/ghost.go</span></span> — gh-ost wrapper.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/onlineddl/schema.go</span></span> — internal schema for tracking migrations.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>State machine</h2>
+      <ul>
+        <li><code>Queued</code> → <code>Ready</code> → <code>Running</code> → <code>Complete</code> / <code>Failed</code> / <code>Cancelled</code></li>
+        <li>Each transition logged in <code>_vt.schema_migrations</code>.</li>
+        <li>Each shard runs its own migration concurrently; the workflow finishes when <em>all</em> shards complete.</li>
+      </ul>
+      <pre><code class="language-sql">SELECT migration_uuid, strategy, status, progress
+FROM _vt.schema_migrations
+ORDER BY id DESC LIMIT 10\G</code></pre>
+    </section>
+
+    <section>
+      <h2>Submitting a migration</h2>
+      <pre><code class="language-bash">vtctldclient ApplySchema \
+    --ddl-strategy="vitess" \
+    --sql "ALTER TABLE customer ADD COLUMN tier VARCHAR(16) NOT NULL DEFAULT 'standard'" \
+    customer</code></pre>
+      <p>Returns a list of migration UUIDs (one per shard). Then:</p>
+      <pre><code class="language-bash">vtctldclient OnlineDDL show customer all
+vtctldclient OnlineDDL show customer &lt;uuid&gt;
+vtctldclient OnlineDDL cancel customer &lt;uuid&gt;
+vtctldclient OnlineDDL retry customer &lt;uuid&gt;</code></pre>
+    </section>
+
+    <section>
+      <h2>Cutover &amp; the "table swap"</h2>
+      <ul>
+        <li>The replacement table is created with a suffix like <code>_vt_HOLD_...</code>.</li>
+        <li>At cutover, vttablet runs a <code>RENAME TABLE original TO _old, shadow TO original</code> atomically.</li>
+        <li>Old table is kept around (for the <code>retain</code> period) so you can roll back.</li>
+        <li><strong>tablegc</strong> (<span class="code-cite"><span class="file">go/vt/schema/tablegc.go</span></span>) eventually drops it.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Throttling matters here too</h2>
+      <ul>
+        <li>VReplication-based ALTER backs off when the primary is busy (the throttler).</li>
+        <li>gh-ost has its own throttling knobs; Vitess passes through configuration.</li>
+        <li>Most production users tune the throttler before they tune the ALTER.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Postpone / launch / cleanup</h2>
+      <ul>
+        <li>Migrations can be submitted but <strong>postponed</strong>; you launch them during a maintenance window.</li>
+        <li><code>vtctldclient OnlineDDL launch &lt;uuid&gt;</code> kicks off a postponed one.</li>
+        <li><code>cleanup</code> drops the old shadow tables manually (instead of waiting for tablegc).</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>schemadiff: the planner side</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/schemadiff/</span></span> — diff two schema definitions.</li>
+        <li>Used by Vitess to compute the <em>diff</em> when you provide a new full-table definition.</li>
+        <li>Also useful in code review: "tell me what ALTER this implies".</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">30-min lab</div>
+        <ol>
+          <li>On your sharded customer keyspace: <code>vtctldclient ApplySchema --ddl-strategy=vitess --sql "ALTER TABLE customer ADD COLUMN tier VARCHAR(16) DEFAULT 'std'" customer</code></li>
+          <li>Watch progress: <code>vtctldclient OnlineDDL show customer all</code></li>
+          <li>Look on a target tablet: <code>SELECT * FROM _vt.schema_migrations\G</code></li>
+          <li>Try cancelling mid-run on a long ALTER: <code>vtctldclient OnlineDDL cancel customer &lt;uuid&gt;</code></li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Why doesn't online DDL directly modify the original table?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Big ALTERs rewrite the table — long-running, blocking, replication lag explodes. The shadow-table approach copies in the background, then renames atomically. Original table sees minimal disruption.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. After cutover, what holds the "old" table?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">A renamed table like <code>_vt_HOLD_...</code>. It sticks around for a retention period (operator-configurable) so you can roll back. <code>tablegc</code> eventually drops it.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Pick a DDL strategy by name.</li>
+          <li>Monitor a migration via <code>_vt.schema_migrations</code> on a target tablet.</li>
+          <li>Cancel or postpone migrations as needed.</li>
+        </ul>
+      </div>
+      <p>Next: the throttler that gates VReplication and online DDL.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/onlineddl/executor.go</span></span> — the state machine. Read top to bottom; it's gnarly but well-commented.</li>
+        <li><a href="https://vitess.io/docs/user-guides/schema-changes/" target="_blank">Vitess docs · schema changes</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

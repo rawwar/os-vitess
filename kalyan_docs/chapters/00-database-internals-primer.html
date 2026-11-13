@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 03 · Database Internals Primer</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="03" data-title="Database Internals Primer" data-part="Part 0 — Foundations Before Vitess" style="display:none;"></div>
+
+  <div id="slides">
+
+    <section class="title-slide" id="hero">
+      <div class="part-tag">Part 0 · Chapter 3</div>
+      <h1>What's inside a database?</h1>
+      <p class="subtitle">Before we read any MySQL or Vitess code, let's build a mental picture of what every relational database is doing under the hood. This is the picture every later chapter will keep referring back to.</p>
+    </section>
+
+    <section id="objectives">
+      <h2>What this chapter gives you</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Trace the path from "client SQL" to "rows on disk" in five clear steps.</li>
+          <li>Picture how a tree-shaped index makes lookups <code>O(log N)</code>.</li>
+          <li>Explain locks, isolation, <span class="g" data-term="mvcc">MVCC</span>, and why long transactions hurt everyone.</li>
+          <li>Define replication, name its two failure modes, and counter the "a replica is a backup" misconception.</li>
+        </ul>
+      </div>
+      <p>The next chapter (Go primer) is a tool break. After that, we cross into MySQL specifics. Everything below applies just as much to PostgreSQL or SQLite — and that's the point: most database mental models are portable.</p>
+    </section>
+
+    <section id="big-picture">
+      <h2>The big picture</h2>
+      <p>Every relational database is, at a slightly cartoonish level, the same five-box pipeline. Bytes come in over the network, get parsed and planned and executed, and rows come back out. Storage of the actual data is its own world, talked to via an internal API.</p>
+      <div class="mermaid">
+flowchart LR
+    Client[client] -->|SQL over network| Server[server process]
+    subgraph DBProcess [database process]
+        Parser[parse]
+        Planner[plan]
+        Exec[execute]
+        Storage[storage engine]
+        Buffer[buffer pool · RAM]
+    end
+    Server --> Parser --> Planner --> Exec --> Storage
+    Buffer <--> Storage
+    Storage --> Disk[(data files on disk)]
+      </div>
+      <p>You'll see this pattern again in <span class="g" data-term="vtgate">vtgate</span>: SQL comes in, gets parsed, planned, executed — except instead of touching disk, vtgate's "executor" sends RPCs to vttablets. The shape is so similar that reading <code>go/vt/vtgate/executor.go</code> feels uncannily like reading a tiny standalone database.</p>
+      <p>Of the five boxes, the one most worth understanding deeply is the <strong>storage engine</strong> — because that's where the disk-shaped reality lives. The parser/planner/executor are about translating SQL into operations; the storage engine is where pages get read, locks get held, and durability gets guaranteed.</p>
+    </section>
+
+    <section id="pages">
+      <h2>Pages: rows never sit alone</h2>
+      <p>Disks read and write in chunks, not bytes. The database doesn't fetch one row at a time; it fetches one <em>page</em> — typically 16 KB in MySQL/InnoDB, 8 KB in PostgreSQL. A page holds many rows, plus some bookkeeping.</p>
+      <div class="mermaid">
+flowchart TB
+    page["Page (16 KB)"]
+    page --> r1["row 1: id=1, alice@..."]
+    page --> r2["row 2: id=2, bob@..."]
+    page --> r3["row 3: ..."]
+    page --> rest["...up to ~100 rows"]
+      </div>
+      <p>One consequence: a single-row lookup costs at least one full page read. The other rows in that page came along for free — if you happen to need them soon, they're already in the buffer pool (the in-memory page cache). That's why range scans on a clustered index are cheap: each page contains many adjacent rows.</p>
+      <p>Another consequence: if your rows are large (say, you stored 4 KB of JSON in each), pages hold fewer rows, range scans get slower, and the buffer pool's hit rate drops. Database performance often comes down to "fit more useful data per page".</p>
+    </section>
+
+    <section id="indexes">
+      <h2>Indexes as trees</h2>
+      <p>To find a value without scanning every row, the database needs the data sorted. An index keeps the indexed column's values in a tree where each lookup is a few comparisons.</p>
+      <p>To find <code>customer_id = 42</code>: compare to the root node's keys, pick a branch; compare to the child node's keys, pick again; repeat until you reach a leaf, which points at the row. For a billion rows, this takes about four or five hops. That's the entire performance promise of relational databases — without it, everything would be linear scans.</p>
+      <div class="callout">
+        <div class="callout-title">"B+ tree" is just a particular sorted tree</div>
+        Every relational database uses some variant of a B-tree. MySQL/InnoDB uses a <span class="g" data-term="btree">B+ tree</span> with a twist: the <em>primary key index</em> stores the rows themselves at its leaves (a "clustered" index). Secondary indexes store the primary key value at their leaves, which means a secondary-index lookup followed by a row fetch is actually two B+ tree lookups — first into the secondary index, then into the primary.
+      </div>
+      <p>This detail will matter in chapter 8 when we talk about why a primary key choice in MySQL has knock-on effects for every other index on the table. It also matters for Vitess: when Vitess picks a sharding key, it's usually picking the column most queries filter by — which is also typically the primary key.</p>
+    </section>
+
+    <section id="concurrency">
+      <h2>Concurrency: two writers, one row</h2>
+      <p>What happens when Alice and Bob simultaneously try to add $50 to the same bank balance? Without coordination, this:</p>
+      <div class="mermaid">
+sequenceDiagram
+    participant A as Alice
+    participant B as Bob
+    participant DB as DB
+    A->>DB: read balance (100)
+    B->>DB: read balance (100)
+    A->>DB: write balance = 150
+    B->>DB: write balance = 150
+    Note over DB: lost $50!
+      </div>
+      <p>Both reads saw 100. Both writes set 150. The bank lost $50. This is a <strong>race condition</strong>, and any database used for real money has to prevent it. The fix is <strong>locking</strong>: whichever writer grabs the row first holds an exclusive lock; the other waits until the first commits.</p>
+      <p>Locks come in flavors. A <em>shared</em> (read) lock can be held by many readers at once but blocks all writers. An <em>exclusive</em> (write) lock blocks all readers and writers. Locks can apply at row level (cheap, granular) or at table level (rare, used for DDL). In InnoDB, almost all locks are row-level — which is why a busy update on one row doesn't paralyze the rest of the table.</p>
+      <div class="callout warn">
+        <div class="callout-title">Deadlocks</div>
+        Two transactions can wait for each other's locks forever. <code>T1</code> holds row A and wants row B; <code>T2</code> holds row B and wants row A. Neither will ever release. InnoDB detects this within a few milliseconds, picks the "smaller" transaction, and aborts it with a <em>Deadlock found when trying to get lock</em> error. Your app's job is to retry the aborted transaction. Vitess preserves this behavior unchanged within a shard.
+      </div>
+    </section>
+
+    <section id="isolation-mvcc">
+      <h2>Isolation: how separate are transactions?</h2>
+      <p>Even with locks, you need to decide what one transaction sees when others commit in the meantime. MySQL's default <span class="g" data-term="isolation">isolation</span> level is <strong>REPEATABLE READ</strong>: each transaction gets a consistent snapshot of the database at the moment it starts, and reads return that snapshot regardless of concurrent commits. Writers don't block readers; readers don't block writers. This is implemented via <span class="g" data-term="mvcc">MVCC</span> (Multi-Version Concurrency Control).</p>
+      <p>The mechanism: InnoDB never overwrites a row in place. An <code>UPDATE</code> creates a new version of the row; the old version stays in the <strong>undo log</strong>, tagged with the transaction ID that wrote it. When a reader's snapshot would see the old version, InnoDB serves the old version from undo. When all transactions that need a given old version finish, the undo entry can be purged.</p>
+      <p>Most of the time you don't notice MVCC. You notice it when something goes wrong.</p>
+      <div class="callout">
+        <div class="callout-title">Long transactions hurt everyone</div>
+        Every old row version lives in the undo log. A transaction open for hours forces InnoDB to keep an ever-growing pile of old versions for it. Concurrent writes pile on more. The undo log balloons; the buffer pool fills with rarely-used versions; performance falls off. In Vitess this is doubly bad: a long transaction at the app also holds a vtgate connection, which holds a vttablet pool slot, which holds the MySQL connection. CLAUDE.md is explicit about this: don't hold transactions open while you do slow work.
+      </div>
+    </section>
+
+    <section id="wal">
+      <h2>Crash recovery and the write-ahead log</h2>
+      <p>Disks lose power. Kernels panic. The database has to guarantee that once it tells the client "your COMMIT succeeded," the data is durable even if the server vanishes a millisecond later. That guarantee is built on the <strong>write-ahead log</strong> (WAL).</p>
+      <p>The trick is to never write the actual data page first. Instead:</p>
+      <ol>
+        <li>Append the change description to a log file. Sequential writes to a single file are <em>very</em> fast — much faster than scattered page writes.</li>
+        <li>Once the log entry is durable (the disk has acknowledged the write), tell the client "committed".</li>
+        <li>Later, lazily flush the actual data pages from the buffer pool to their permanent locations.</li>
+        <li>If the server crashes between steps 2 and 3, replay the log on startup. Every committed change is recovered.</li>
+      </ol>
+      <p>In MySQL, this log is the <strong>redo log</strong>. InnoDB replays it during startup to bring the data files back up to the last committed transaction.</p>
+    </section>
+
+    <section id="four-logs">
+      <h2>Three logs you'll meet</h2>
+      <p>Beginners often conflate "logs" in MySQL because there are several of them and the names overlap. Here are the three that matter:</p>
+      <table class="compare">
+        <tr><th>Log</th><th>Purpose</th><th>Who reads it</th></tr>
+        <tr><td>Redo</td><td>Crash recovery</td><td>InnoDB itself, at startup</td></tr>
+        <tr><td>Undo</td><td>Rollback + MVCC old versions</td><td>InnoDB itself, during transactions</td></tr>
+        <tr><td><span class="g" data-term="binlog">Binlog</span></td><td>Replication &amp; change feed</td><td>Other MySQLs and <span class="g" data-term="vitess">Vitess</span></td></tr>
+      </table>
+      <p>The redo log is physical (page-level), circular, and internal. The undo log is conceptually a list of "how to undo each change" entries. Both serve InnoDB internally and are not exposed to the outside world.</p>
+      <p>The <strong>binlog</strong> is different. It's a logical record of every row change (or every SQL statement, depending on format), written by the server layer above the storage engine. Its primary purpose is replication: other MySQLs read it to stay in sync with this one. Vitess uses it for the same reason and also for VReplication — copying rows between shards, materializing views, online schema changes. We'll spend chapter 9 on the binlog in detail.</p>
+      <div class="callout success">
+        <div class="callout-title">Internalize this</div>
+        The redo log keeps a single MySQL durable. The binlog keeps <em>multiple</em> MySQLs in sync. They sound similar; they serve different purposes. Vitess only cares about the second.
+      </div>
+    </section>
+
+    <section id="replication">
+      <h2>Replication: one DB, many copies</h2>
+      <p>At its simplest, MySQL replication is one server (the <span class="g" data-term="primary">primary</span>) writing every change to its binlog, and other servers (the <span class="g" data-term="replica">replicas</span>) opening a long-running connection to stream those events and replay them locally.</p>
+      <div class="mermaid">
+flowchart LR
+    primary[(primary)] -->|stream of binlog events| r1[(replica 1)]
+    primary -->|stream of binlog events| r2[(replica 2)]
+    primary -->|stream of binlog events| r3[(replica 3)]
+      </div>
+      <p>Replicas serve reads — the app can route SELECTs to them to scale read throughput. If the primary dies, one of the replicas is <strong>promoted</strong> and starts accepting writes. Most of Vitess's automation is, ultimately, in service of making that promotion safe and fast.</p>
+      <p>Replication is <em>asynchronous by default</em>: the primary writes its binlog, acknowledges the COMMIT to the client, and only then do replicas pull the event. If the primary dies in that tiny window between "acknowledge COMMIT" and "replica receives event", that committed write is lost from the cluster's point of view. The window is small (milliseconds, usually) but not zero.</p>
+    </section>
+
+    <section id="async-semisync">
+      <h2>Replicas can lag, and semi-sync helps</h2>
+      <p>Replicas can fall behind for many reasons: a slow disk, a heavy local read query stealing CPU, a long-running ALTER, simple network delay. Replication lag — measured in seconds-behind-primary — is the single most-watched metric in a MySQL ops dashboard.</p>
+      <div class="callout warn">
+        <div class="callout-title">Replicas can lag</div>
+        A replica that's 10 seconds behind has 10 seconds' worth of writes still pending. If the primary dies, those writes don't exist on that replica. Some other replica might have them; some replica must be picked carefully to promote.
+      </div>
+      <p>The fix for the worst version of this is <strong>semi-synchronous replication</strong>. With semi-sync turned on, the primary waits for at least one replica to acknowledge receipt of an event before saying "committed" to the client. The trade-off is latency — every commit now blocks on a network round-trip. The benefit is correctness: at least one replica has the data the primary acked. Vitess strongly encourages semi-sync because its failover logic (chapter 23) depends on it.</p>
+      <div class="callout misc">
+        <div class="callout-title">"A replica is a backup"</div>
+        <strong>No.</strong> If you run <code>DROP TABLE customer</code> on the primary, it replicates to every replica within seconds. Replicas protect you against hardware failure, not human error. You still need point-in-time backups. We cover Vitess's backup story in chapter 30.
+      </div>
+    </section>
+
+    <section id="recap-prep">
+      <h2>What this lets you do</h2>
+      <p>You now have a working mental model of any relational database. Rows live in pages on disk. Indexes are trees that make lookups <code>O(log N)</code>. Concurrent transactions use locks plus MVCC to avoid corrupting each other. A WAL makes the database crash-safe. The binlog feeds replicas and change consumers like Vitess.</p>
+      <p>From here, every chapter will refine and specialize this picture. Chapter 8 zooms into MySQL's InnoDB specifically. Chapter 9 zooms into the binlog and GTIDs. Chapter 25 layers sharding on top. You'll keep coming back to this picture in particular, so it's worth re-reading the diagrams above once before moving on.</p>
+    </section>
+
+    <section id="lab">
+      <h2>Lab: peek inside a real MySQL</h2>
+      <div class="lab">
+        <div class="lab-title">20 min · MySQL 8 (Docker is fine)</div>
+        <p>If you don't have MySQL handy, skip this — chapter 14 will give you a real cluster to play with.</p>
+        <ol>
+          <li>Start a throwaway MySQL: <pre><code class="language-bash">docker run --rm -d --name learn-mysql \
+  -e MYSQL_ROOT_PASSWORD=root \
+  -p 3306:3306 mysql:8.0
+sleep 10
+mysql -h 127.0.0.1 -uroot -proot</code></pre></li>
+          <li>Inside the mysql prompt, peek at the things you just read about: <pre><code class="language-sql">SHOW VARIABLES LIKE '%log_bin%';
+SHOW VARIABLES LIKE '%isolation%';
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';</code></pre></li>
+          <li>Look at the engine's live state: <pre><code class="language-sql">SHOW ENGINE INNODB STATUS\G</code></pre></li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">What to notice</div>
+          <ul>
+            <li><code>log_bin</code> is <code>ON</code> by default in MySQL 8. That's the binlog being written.</li>
+            <li><code>transaction_isolation</code> is <code>REPEATABLE-READ</code> — the snapshot model we discussed.</li>
+            <li>In the INNODB STATUS output, search for <strong>BUFFER POOL AND MEMORY</strong> — that's the in-memory page cache. <strong>TRANSACTIONS</strong> shows every active transaction.</li>
+          </ul>
+        </div>
+        <div class="lab-step">
+          <div class="expected-label">Clean up</div>
+<pre class="expected">docker stop learn-mysql
+</pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="quiz">
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Why does the database read 16 KB at a time even when you only asked for one row?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">A page is the unit of disk I/O. Reading less wouldn't be faster, because the underlying disk reads in blocks anyway. So MySQL packs ~100 rows into each page; if your next read is nearby, those rows are already in memory.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Replica X is 10 seconds behind the primary. The primary dies. Did we lose data?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">With vanilla async replication, yes — the last 10 seconds of committed writes are gone from this replica. With semi-sync replication, at least one replica is guaranteed to have every committed write; the question becomes which replica. Vitess's failover picks the most-advanced replica precisely for this reason.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Why is a replica <em>not</em> a backup?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">A replica copies <em>every</em> change — including destructive ones. <code>DROP TABLE</code> on the primary propagates to every replica within seconds. Replicas protect you from hardware failure; only point-in-time backups protect you from human error.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">4. The redo log and the binlog both record changes. What's the difference?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Redo is for crash recovery — replayed by the same MySQL on startup, physical (page-level), and never leaves the server. Binlog is for replication and external consumers — replayed by other MySQLs and by Vitess, logical (row or statement events), and explicitly designed to be consumed by other processes.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">5. A transaction is open for four hours. Why does that hurt the entire MySQL, not just the slow caller?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">MVCC keeps old row versions in the undo log so the long transaction can still see its snapshot. Every concurrent write piles on more old versions. The undo log balloons; the buffer pool fills with old versions; performance degrades for everyone.</div></details>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Draw the five-box pipeline from client to disk.</li>
+          <li>Explain why indexes help reads but hurt writes.</li>
+          <li>Say what isolation level MySQL defaults to and why long transactions are bad.</li>
+          <li>Describe replication in one sentence: "the primary's binlog is streamed to replicas, which apply it."</li>
+          <li>Counter the misconception that a replica is a backup.</li>
+        </ul>
+      </div>
+      <p>Next chapter: enough Go to read Vitess source — not to write Go, just to navigate it. The chapter after that is the terminal/repo primer, and then we're inside MySQL and Vitess proper.</p>
+    </section>
+
+    <section id="further-reading">
+      <h2>Further reading</h2>
+      <ul>
+        <li>Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, chapters 3 (storage) and 5 (replication). The best modern book on this material.</li>
+        <li>Jeremy Cole's blog series <em>InnoDB: A journey to the core</em> — page layouts and B+ tree internals at the byte level.</li>
+        <li><a href="https://use-the-index-luke.com/" target="_blank">use-the-index-luke.com</a> — explicit, intuitive treatment of indexes.</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

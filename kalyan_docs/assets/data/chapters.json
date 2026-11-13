@@ -1,0 +1,69 @@
+[
+  {
+    "part": "Part 0 — Foundations Before Vitess",
+    "chapters": [
+      { "id": 100, "slug": "00-learning-path", "title": "Your Learning Path", "minutes": 8, "difficulty": "intro" },
+      { "id": 101, "slug": "00-sql-refresher", "title": "SQL Refresher", "minutes": 25, "difficulty": "intro" },
+      { "id": 102, "slug": "00-database-internals-primer", "title": "Database Internals Primer", "minutes": 20, "difficulty": "beginner" },
+      { "id": 103, "slug": "00-go-reading-primer", "title": "Reading Go Without Knowing Go", "minutes": 20, "difficulty": "beginner" },
+      { "id": 104, "slug": "00-terminal-and-repo-primer", "title": "Terminal & Repo Primer", "minutes": 15, "difficulty": "intro" }
+    ]
+  },
+  {
+    "part": "Part I — MySQL from a Code Perspective",
+    "chapters": [
+      { "id": 1, "slug": "01-welcome", "title": "Welcome & How to Use This Tutorial", "minutes": 5, "difficulty": "intro" },
+      { "id": 2, "slug": "02-why-vitess", "title": "What Problem Vitess Solves", "minutes": 10, "difficulty": "intro" },
+      { "id": 3, "slug": "03-mysql-architecture", "title": "MySQL Architecture & InnoDB Internals", "minutes": 25, "difficulty": "beginner" },
+      { "id": 4, "slug": "04-mysql-replication", "title": "MySQL Replication & GTIDs", "minutes": 25, "difficulty": "beginner" },
+      { "id": 5, "slug": "05-mysql-protocol", "title": "The MySQL Wire Protocol in Go", "minutes": 25, "difficulty": "intermediate" },
+      { "id": 6, "slug": "06-connection-pooling", "title": "Connection Lifecycle & Pooling", "minutes": 15, "difficulty": "intermediate" }
+    ]
+  },
+  {
+    "part": "Part II — Vitess at a Glance",
+    "chapters": [
+      { "id": 7, "slug": "07-architecture", "title": "High-Level Architecture", "minutes": 15, "difficulty": "beginner" },
+      { "id": 8, "slug": "08-repo-map", "title": "The Repository Map", "minutes": 12, "difficulty": "beginner" },
+      { "id": 9, "slug": "09-building-vitess", "title": "Building & Running Vitess Locally", "minutes": 30, "difficulty": "beginner" },
+      { "id": 10, "slug": "10-code-conventions", "title": "Code Conventions & Generated Code", "minutes": 15, "difficulty": "intermediate" }
+    ]
+  },
+  {
+    "part": "Part III — vtgate: The Query Router",
+    "chapters": [
+      { "id": 11, "slug": "11-topology-service", "title": "Topology Service", "minutes": 20, "difficulty": "intermediate" },
+      { "id": 12, "slug": "12-vtgate-lifecycle", "title": "vtgate Request Lifecycle", "minutes": 25, "difficulty": "intermediate" },
+      { "id": 13, "slug": "13-sql-parser", "title": "SQL Parser & AST", "minutes": 30, "difficulty": "advanced" },
+      { "id": 14, "slug": "14-query-planner", "title": "Semantic Analysis & Gen4 Planner", "minutes": 30, "difficulty": "advanced" },
+      { "id": 15, "slug": "15-query-execution", "title": "Query Execution Engine", "minutes": 25, "difficulty": "advanced" }
+    ]
+  },
+  {
+    "part": "Part IV — vttablet: The Data Plane",
+    "chapters": [
+      { "id": 16, "slug": "16-vttablet-overview", "title": "vttablet Overview", "minutes": 20, "difficulty": "intermediate" },
+      { "id": 17, "slug": "17-tablet-manager", "title": "Tablet Manager RPCs", "minutes": 20, "difficulty": "intermediate" },
+      { "id": 18, "slug": "18-replication-vtorc", "title": "Replication Management & VTOrc", "minutes": 25, "difficulty": "advanced" },
+      { "id": 19, "slug": "19-mysqlctl", "title": "mysqlctl: Managing mysqld", "minutes": 15, "difficulty": "intermediate" }
+    ]
+  },
+  {
+    "part": "Part V — Sharding & VReplication",
+    "chapters": [
+      { "id": 20, "slug": "20-sharding-fundamentals", "title": "Sharding Fundamentals & Vindexes", "minutes": 30, "difficulty": "advanced" },
+      { "id": 21, "slug": "21-vreplication", "title": "VReplication Internals", "minutes": 30, "difficulty": "advanced" },
+      { "id": 22, "slug": "22-resharding", "title": "Resharding & MoveTables", "minutes": 25, "difficulty": "advanced" },
+      { "id": 23, "slug": "23-online-ddl", "title": "Online DDL & Schema Migrations", "minutes": 20, "difficulty": "advanced" },
+      { "id": 24, "slug": "24-throttler", "title": "Throttler & Traffic Management", "minutes": 15, "difficulty": "advanced" },
+      { "id": 25, "slug": "25-backups", "title": "Backups & Restores", "minutes": 15, "difficulty": "intermediate" }
+    ]
+  },
+  {
+    "part": "Part VI — Contributing to Vitess",
+    "chapters": [
+      { "id": 26, "slug": "26-testing", "title": "Testing in Vitess", "minutes": 20, "difficulty": "intermediate" },
+      { "id": 27, "slug": "27-first-pr", "title": "Your First Pull Request", "minutes": 20, "difficulty": "beginner" }
+    ]
+  }
+]

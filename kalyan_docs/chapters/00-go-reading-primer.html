@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 04 · Reading Go Without Knowing Go</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="04" data-title="Reading Go Without Knowing Go" data-part="Part 0 — Foundations Before Vitess" style="display:none;"></div>
+
+  <div id="slides">
+
+    <section class="title-slide" id="hero">
+      <div class="part-tag">Part 0 · Chapter 4</div>
+      <h1>Go, just enough to read.</h1>
+      <p class="subtitle">Vitess is about ninety-five percent Go. Good news: Go is a small language. Even better news: <em>reading</em> Go is dramatically easier than writing it. This chapter teaches the patterns that appear in every Vitess file, with concrete examples you can match against real code.</p>
+    </section>
+
+    <section id="objectives">
+      <h2>What this chapter gives you</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Open any Vitess Go file and identify its package, imports, types, and functions in 30 seconds.</li>
+          <li>Recognize structs, interfaces, and methods — and connect interfaces to their implementations.</li>
+          <li>Skim past Go's noisy error-handling boilerplate while still reading what matters.</li>
+          <li>Recognize goroutines, channels, and <code>context.Context</code> usage without panicking.</li>
+          <li>Find the entry point of any Vitess binary in well under a minute.</li>
+        </ul>
+      </div>
+      <p>Don't try to memorize Go's syntax. Pattern-match. Most Go code you'll meet in Vitess uses a small repertoire of forms over and over.</p>
+    </section>
+
+    <section id="file-shape">
+      <h2>The shape of a Go file</h2>
+      <p>Every Go file in Vitess follows the same top-down order: package declaration, imports, types, functions. Once you've seen one, you can predict where everything will be in the next.</p>
+<pre><code class="language-go">// every file starts with the package it belongs to
+package vtgate
+
+// then imports, grouped (stdlib first, then 3rd party, then local)
+import (
+    "context"
+    "fmt"
+
+    "github.com/spf13/pflag"
+
+    "vitess.io/vitess/go/vt/log"
+)
+
+// then types (structs, interfaces, type aliases)
+type Executor struct {
+    // fields
+}
+
+// then functions and methods
+func NewExecutor(...) *Executor { ... }
+func (e *Executor) Execute(...) error { ... }</code></pre>
+      <p>The import block tells you a lot before you read a single function. Stdlib imports (<code>context</code>, <code>fmt</code>, <code>io</code>, etc.) suggest what kind of file this is. Third-party imports (<code>github.com/spf13/pflag</code>) tell you which external libraries are in play. Local imports starting with <code>vitess.io/vitess/...</code> tell you which other Vitess packages this file depends on — usually the answer to "where do I look next?" lives there.</p>
+    </section>
+
+    <section id="packages">
+      <h2>Packages: one directory equals one package</h2>
+      <p>In Go, all <code>.go</code> files in a single directory belong to the same package. They share state without needing to import each other. The package name usually matches the directory name (with hyphens and digits removed).</p>
+      <ul>
+        <li><code>go/vt/vtgate/</code> contains dozens of <code>.go</code> files all declaring <code>package vtgate</code>. They can freely call each other's functions.</li>
+        <li>Other packages import <code>"vitess.io/vitess/go/vt/vtgate"</code> and refer to its exported names as <code>vtgate.Foo</code>.</li>
+        <li>Subdirectories are <em>different</em> packages: <code>go/vt/vtgate/engine/</code> declares <code>package engine</code>, and other code imports it as <code>vtgate/engine</code>.</li>
+      </ul>
+      <div class="callout success">
+        <div class="callout-title">Quick navigation trick</div>
+        When you see <code>engine.Plan</code> in a Vitess file, that's the <code>Plan</code> type from the <code>engine</code> package. Look at the file's <code>import</code> block to find the full path (<code>vitess.io/vitess/go/vt/vtgate/engine</code>), strip the prefix, and you have a directory to jump to. This trick alone speeds up code reading enormously.
+      </div>
+    </section>
+
+    <section id="structs">
+      <h2>Structs: data containers</h2>
+      <p>A struct is just a named record — a collection of fields with types. The shape is exactly what a row in a SQL table looks like.</p>
+<pre><code class="language-go">type Customer struct {
+    ID        int
+    Email     string
+    Country   string
+}
+
+c := Customer{ID: 1, Email: "alice@example.com", Country: "US"}
+fmt.Println(c.Email)</code></pre>
+      <p>Field names that start with an uppercase letter are <strong>exported</strong> — visible to other packages. Lowercase field names are private to the package. The same rule applies to type names, function names, and method names. This is Go's "no <code>public</code>/<code>private</code> keywords; capitalization is the access modifier" convention. Once you know it, you can skim any struct and instantly see what's the public API and what's internal.</p>
+<pre><code class="language-go">type Executor struct {
+    serv      srvtopo.Server  // unexported, package-private
+    Resolver  *Resolver       // exported — other packages can use
+}</code></pre>
+    </section>
+
+    <section id="methods">
+      <h2>Methods: functions attached to types</h2>
+      <p>A method is a function with an extra <strong>receiver</strong> that names the type it belongs to. The receiver appears in parentheses between <code>func</code> and the method name.</p>
+<pre><code class="language-go">// The (e *Executor) part is the receiver — what the method is attached to.
+func (e *Executor) Execute(ctx context.Context, sql string) (*Result, error) {
+    // ...
+}
+
+// Call it like this:
+result, err := e.Execute(ctx, "SELECT 1")</code></pre>
+      <p>Two flavors of receiver, and the difference matters when you read code:</p>
+      <ul>
+        <li><code>(e *Executor)</code> — <em>pointer receiver</em>. The method operates on the original Executor. It can modify the struct's fields. Almost everything in Vitess uses pointer receivers.</li>
+        <li><code>(e Executor)</code> — <em>value receiver</em>. The method operates on a copy. Modifications stay inside the method. Common for small immutable types like <code>time.Time</code>.</li>
+      </ul>
+      <p>Methods on different types can share names without conflict — <code>(e *Executor) Close()</code> and <code>(c *Conn) Close()</code> are two distinct functions. This is how Go gets "polymorphism" without classes.</p>
+    </section>
+
+    <section id="interfaces">
+      <h2>Interfaces: "anything with these methods"</h2>
+      <p>An interface is a named set of method signatures. Here's an example from Vitess:</p>
+<pre><code class="language-go">type QueryService interface {
+    Execute(ctx context.Context, sql string) (*Result, error)
+    Begin(ctx context.Context) (int64, error)
+    Commit(ctx context.Context, txID int64) error
+}</code></pre>
+      <p>Any type that has all three of those methods <em>automatically</em> implements <code>QueryService</code> — no <code>implements</code> keyword, no explicit declaration. This is called "structural typing" and it's one of Go's most useful features.</p>
+      <p>Why it matters for Vitess: the project uses interfaces to swap real components with fakes. <code>QueryService</code> has a real gRPC-backed implementation, but tests use a fake one (<code>sandboxconn</code>) that satisfies the same interface. Callers never know the difference. When you read code that takes a <code>QueryService</code>, look for the variable name to guess which implementation runs — but trust that the interface is the contract.</p>
+      <div class="callout">
+        <div class="callout-title">Spot the assertion</div>
+        Sometimes you'll see <code>var _ QueryService = (*RealQueryService)(nil)</code> at the top of a file. That's a compile-time assertion: it forces the compiler to fail if <code>RealQueryService</code> ever stops satisfying <code>QueryService</code>. Useful when an interface gets a new method — the assertion shows you where to update.
+      </div>
+    </section>
+
+    <section id="errors">
+      <h2>Errors: Go's most-criticized feature</h2>
+      <p>Go has no exceptions. Functions that can fail return an extra <code>error</code> value, and callers check it after every call. This is the famous "noisy" Go style:</p>
+<pre><code class="language-go">result, err := db.Query("SELECT 1")
+if err != nil {
+    return nil, vterrors.Wrapf(err, "query failed for user %s", userID)
+}
+// ... use result ...
+
+other, err := otherCall()
+if err != nil {
+    return nil, vterrors.Wrap(err, "otherCall failed")
+}</code></pre>
+      <p>It looks repetitive because it is. The trade-off is that you can't accidentally swallow an error — every error path is in your face. Vitess wraps errors with <code>vterrors.Wrapf</code> to add context as they bubble up; by the time an error reaches the user, it has a trail of "what was happening when this failed".</p>
+      <p>When you read code, train yourself to <em>skim past</em> the error-handling lines on first pass. The interesting logic is between them. Once you've understood the happy path, come back and read what each error case does — sometimes it's a retry, sometimes it's a transformation, sometimes it's a metric increment.</p>
+    </section>
+
+    <section id="context">
+      <h2><code>context.Context</code> — the deadline carrier</h2>
+      <p>Almost every long-running function in Vitess takes a <code>ctx context.Context</code> as its first argument. The <code>ctx</code> carries:</p>
+      <ul>
+        <li>A <strong>deadline</strong> — how long this call may run before being cancelled.</li>
+        <li>A <strong>cancellation signal</strong> — if the caller stops caring (client disconnected, timeout fired), the signal propagates downstream.</li>
+        <li><strong>Values</strong> — caller identity, trace IDs, request-scoped metadata.</li>
+      </ul>
+<pre><code class="language-go">func (e *Executor) Execute(ctx context.Context, sql string) (*Result, error) {
+    ctx, cancel := context.WithTimeout(ctx, 30 * time.Second)
+    defer cancel()
+    // ... pass ctx to every downstream call ...
+}</code></pre>
+      <p>The <code>defer cancel()</code> idiom ensures resources are released when the function exits, no matter how. This pattern is everywhere in Vitess.</p>
+      <p>When you read code, the presence of <code>ctx</code> is a hint: this is a network or long-running operation, and it can be cancelled. The absence of <code>ctx</code> is a hint: this is pure computation or in-memory work, and it can't be interrupted from outside.</p>
+    </section>
+
+    <section id="goroutines-channels">
+      <h2>Goroutines and channels: cheap concurrency</h2>
+      <p>Prefix any function call with <code>go</code> and it runs in a new <strong>goroutine</strong> — a lightweight thread of execution. Vitess routinely runs thousands at a time without breaking a sweat.</p>
+<pre><code class="language-go">for _, shard := range shards {
+    go executeOnShard(ctx, shard, query)
+}</code></pre>
+      <p>The catch: that loop doesn't wait for any of the goroutines to finish. To collect results you need a synchronization tool. The two most common in Vitess are <code>sync.WaitGroup</code> (for "wait until all of these finish") and <strong>channels</strong> (for "send me each result as it arrives").</p>
+<pre><code class="language-go">results := make(chan *Result, len(shards))
+for _, shard := range shards {
+    go func(s string) {
+        r, _ := executeOnShard(ctx, s, query)
+        results &lt;- r          // send into the channel
+    }(shard)
+}
+for i := 0; i &lt; len(shards); i++ {
+    r := &lt;-results            // receive from the channel
+    combine(r)
+}</code></pre>
+      <p>Channels are typed: <code>chan *Result</code> only carries <code>*Result</code> values. The arrow tells you direction — <code>ch &lt;- value</code> sends, <code>x := &lt;-ch</code> receives. When you see a channel of an empty struct (<code>chan struct{}</code>), it's a signal channel — just for notification, no data.</p>
+    </section>
+
+    <section id="pointers">
+      <h2>Pointers, briefly</h2>
+      <p>You'll see <code>*</code> everywhere. There's only one rule to internalize:</p>
+<pre><code class="language-go">c := Customer{ID: 1}
+p := &amp;c                   // p is a pointer to c
+fmt.Println(p.Email)      // Go auto-dereferences — same as (*p).Email
+p.Email = "alice@b.com"   // modifies c through p</code></pre>
+      <ul>
+        <li><code>&amp;c</code> means "address of <code>c</code>". You get a pointer.</li>
+        <li><code>*p</code> means "the value <code>p</code> points at". You rarely need to write this — Go auto-dereferences in most contexts.</li>
+        <li>In a parameter or return type, <code>*Foo</code> means "pointer to a Foo". Treat it like a JavaScript object reference.</li>
+      </ul>
+      <p>When should code use a pointer? Usually when the value is large, when the function needs to modify the original, or when you want to express "this might be missing" (with <code>nil</code>). Vitess strongly prefers pointers for any non-trivial struct.</p>
+    </section>
+
+    <section id="skip-on-first-pass">
+      <h2>What to skip on first pass</h2>
+      <p>Go has a few features that show up less often in Vitess and that you can safely defer learning:</p>
+      <ul>
+        <li><strong>Generics</strong> (<code>func Map[T any](...)</code>) — used sparingly. Mentally substitute "works for any type" and move on.</li>
+        <li><strong><code>select</code> with multiple cases</strong> — this is coordination logic for channels. Read the comments; come back to the details later.</li>
+        <li><strong>Reflection</strong> (<code>reflect.Value</code>) — only in serialization-heavy code. Read at the function-signature level.</li>
+        <li><strong>Build tags</strong> (<code>//go:build linux</code>) — different code paths for different OSes. Pick the file matching your OS and read that one.</li>
+        <li><strong>cgo</strong> (<code>import "C"</code>) — Vitess uses it rarely. Skip these files unless you specifically need them.</li>
+      </ul>
+      <p>None of these block you from understanding most of the code. They become useful later, after you have the big picture.</p>
+    </section>
+
+    <section id="worked-example">
+      <h2>A complete example to anchor everything</h2>
+      <p>Here's a small but realistic Go program that uses every concept above:</p>
+<pre><code class="language-go">package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+// Type definition — a struct with two fields, both exported.
+type Customer struct {
+    ID    int
+    Email string
+}
+
+// Method with a pointer receiver. Returns a derived string.
+func (c *Customer) Greet() string {
+    return fmt.Sprintf("hello, %s", c.Email)
+}
+
+// Function that can fail. Notice ctx first, error last.
+func getCustomer(ctx context.Context, id int) (*Customer, error) {
+    if id &lt;= 0 {
+        return nil, fmt.Errorf("invalid id %d", id)
+    }
+    return &amp;Customer{ID: id, Email: "alice@example.com"}, nil
+}
+
+func main() {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    c, err := getCustomer(ctx, 1)
+    if err != nil {
+        fmt.Println("error:", err)
+        return
+    }
+    fmt.Println(c.Greet())
+}</code></pre>
+      <p>Walk through it: a struct (<code>Customer</code>), a pointer-receiver method (<code>Greet</code>), a function that returns <code>(*Customer, error)</code> (the standard Go shape), a <code>main</code> that creates a context with timeout, calls the function, checks the error, and calls the method. Every Vitess file is a variation on this — just bigger, with more types and more layers.</p>
+    </section>
+
+    <section id="common-patterns">
+      <h2>Patterns you'll see again and again</h2>
+      <p>A small vocabulary of idioms covers most of what's interesting in Vitess code:</p>
+      <table class="compare">
+        <tr><th>Pattern</th><th>What it means</th></tr>
+        <tr><td><code>defer cancel()</code></td><td>Run <code>cancel()</code> when this function exits (regardless of how).</td></tr>
+        <tr><td><code>defer wg.Wait()</code></td><td>Block until all goroutines in this WaitGroup finish.</td></tr>
+        <tr><td><code>select { case &lt;-ctx.Done(): ... }</code></td><td>Wait for cancellation; <code>ctx.Done()</code> fires when the context is cancelled.</td></tr>
+        <tr><td><code>var _ Iface = (*Impl)(nil)</code></td><td>Compile-time check that <code>Impl</code> satisfies <code>Iface</code>.</td></tr>
+        <tr><td><code>sync.Mutex</code> / <code>RWMutex</code></td><td>Lock for thread-safe shared state.</td></tr>
+        <tr><td><code>atomic.Int64</code></td><td>Lock-free integer counter.</td></tr>
+        <tr><td><code>chan struct{}</code></td><td>A signal channel — used for notification, never carries data.</td></tr>
+      </table>
+      <p>If you see something else weird, search <a href="https://gobyexample.com/" target="_blank">gobyexample.com</a> for the syntax. It's the fastest way to look up "what does this Go thing do".</p>
+    </section>
+
+    <section id="lab">
+      <h2>Lab: find a Vitess entrypoint</h2>
+      <div class="lab">
+        <div class="lab-title">15 min · read only, no running</div>
+        <ol>
+          <li>Open <code>go/cmd/vtgate/vtgate.go</code> in your editor. Notice it's tiny — under 30 lines.</li>
+          <li>Find which <code>package</code> it declares and which other packages it imports.</li>
+          <li>The <code>main()</code> function does almost nothing — it delegates to a CLI helper. Find that file: <code>go/cmd/vtgate/cli/cli.go</code> (or similar).</li>
+          <li>Read the CLI file. Stop when you reach <code>cobra.Command</code> setup. That's where command-line flags are declared.</li>
+          <li>Now repeat for <code>go/cmd/vttablet/vttablet.go</code>. Notice the shape is identical.</li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">What to take away</div>
+          Every Vitess binary follows the same shape: a tiny <code>main</code> in <code>go/cmd/&lt;binary&gt;/</code>, a <code>cli</code> sub-package that wires up cobra commands, and the actual logic in <code>go/vt/&lt;subsystem&gt;/</code>. You'll see this pattern in <code>vtgate</code>, <code>vttablet</code>, <code>vtctld</code>, <code>vtorc</code> — every long-running binary. This means: to learn what binary X does, start at <code>go/cmd/X/X.go</code> and follow the imports.
+        </div>
+      </div>
+    </section>
+
+    <section id="learn-more">
+      <h2>If you want to learn more Go</h2>
+      <p>You don't need to. Most of Vitess is readable with pattern-matching. But if you want concrete next steps:</p>
+      <ul>
+        <li><a href="https://go.dev/tour/" target="_blank">A Tour of Go</a> — the official 30-minute interactive intro. Covers everything we just did and a bit more.</li>
+        <li><a href="https://gobyexample.com/" target="_blank">Go by Example</a> — every Go concept as a copy-pasteable snippet. Excellent lookup reference.</li>
+        <li><a href="https://go.dev/blog/error-handling-and-go" target="_blank">Effective Error Handling in Go</a> — explains why the error style is what it is.</li>
+      </ul>
+      <p>None of these are prerequisites for the rest of this course.</p>
+    </section>
+
+    <section id="quiz">
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. What's the difference between <code>Email string</code> and <code>email string</code> on a struct field?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Capital <code>Email</code> is exported — visible outside the package. Lowercase <code>email</code> is private to the package. Same convention applies to functions, types, and methods. Capitalization is Go's access modifier.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. When you see <code>func (e *Executor) Execute(...)</code>, what does the <code>*</code> tell you?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">It's a pointer receiver — the method can read <em>and modify</em> the Executor it's called on. Without the <code>*</code> it would be a copy and modifications wouldn't stick.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Why does almost every Vitess function take <code>ctx context.Context</code> as its first parameter?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Cancellation, deadlines, and tracing propagate through it. If the caller times out or the client disconnects, every downstream call learns about it via the same <code>ctx</code>.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">4. <code>go someFunc()</code> — what's <code>go</code> doing?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">It starts <code>someFunc</code> in a new goroutine — a lightweight concurrent thread of execution. The caller doesn't wait for it to finish.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">5. <code>var _ QueryService = (*sandboxConn)(nil)</code> — what's this idiom doing?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">It's a compile-time assertion that <code>sandboxConn</code> implements the <code>QueryService</code> interface. If anyone removes a method from <code>sandboxConn</code> that <code>QueryService</code> requires, compilation fails right at this line — fast feedback instead of mysterious runtime errors.</div></details>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Open any Vitess Go file and orient yourself in 30 seconds.</li>
+          <li>Recognize structs, methods, and interfaces — and connect interfaces to implementations.</li>
+          <li>Skim past error-handling boilerplate while reading the real logic.</li>
+          <li>Recognize goroutines, channels, and <code>context.Context</code> patterns without panic.</li>
+          <li>Find any Vitess binary's entry point in well under a minute.</li>
+        </ul>
+      </div>
+      <p>Next chapter: how to actually move around the Vitess repository in a terminal without breaking anything. Then Part 0 is done and we cross into MySQL specifics.</p>
+    </section>
+
+    <section id="further-reading">
+      <h2>Further reading</h2>
+      <ul>
+        <li><a href="https://go.dev/tour/" target="_blank">A Tour of Go</a> — interactive, 30 minutes.</li>
+        <li><a href="https://gobyexample.com/" target="_blank">Go by Example</a> — every concept, one snippet each.</li>
+        <li><a href="https://google.github.io/styleguide/go/" target="_blank">Google's Go style guide</a> — explains <em>why</em> Go code looks the way it does.</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

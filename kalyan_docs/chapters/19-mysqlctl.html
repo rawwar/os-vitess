@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 19 · mysqlctl — Managing mysqld</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="19" data-title="mysqlctl — Managing mysqld" data-part="Part IV — vttablet: The Data Plane" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part IV · Chapter 24</div>
+      <h1>The process manager.</h1>
+      <p class="subtitle">Starts, stops, configures, backs up, restores the actual <code>mysqld</code> binary. Where SQL meets Unix.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Tell apart <code>mysqlctl</code> (CLI) and <code>mysqlctld</code> (daemon).</li>
+          <li>Find where my.cnf is generated and how to extend it.</li>
+          <li>Locate the sidecar schema (<code>_vt</code>) inside any tablet's mysqld.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Two binaries, one library</h2>
+      <ul>
+        <li><strong><code>mysqlctl</code></strong> — CLI, one-shot commands (init, start, shutdown).</li>
+        <li><strong><code>mysqlctld</code></strong> — daemon, exposes the same commands as gRPC.</li>
+        <li>Both wrap the library at <span class="code-cite"><span class="file">go/vt/mysqlctl/</span></span>.</li>
+        <li>vttablet talks to mysqlctld over gRPC when it wants to start/stop the mysqld.</li>
+      </ul>
+      <p>Why split? Some environments (Kubernetes) prefer the colocated daemon model.</p>
+    </section>
+
+    <section>
+      <h2>Key files</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/mysqld.go</span></span> — the <code>Mysqld</code> struct, central object.</li>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/cmd.go</span></span> — command dispatch.</li>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/mycnf.go</span></span> — generates <code>my.cnf</code> from a template.</li>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/backup.go</span></span> — backup orchestration.</li>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/replication.go</span></span> — replication SQL helpers.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Initializing a mysqld</h2>
+      <pre><code class="language-bash">mysqlctl init</code></pre>
+      <ol>
+        <li>Generate a <code>my.cnf</code> from the template &amp; flags.</li>
+        <li>Create the data dir.</li>
+        <li>Run <code>mysqld --initialize</code> to create system tables.</li>
+        <li>Start <code>mysqld</code>.</li>
+        <li>Apply the Vitess sidecar schema (a special database for VReplication, online DDL, etc.).</li>
+      </ol>
+      <p>The sidecar schema is in <span class="code-cite"><span class="file">go/vt/sidecardb/</span></span>.</p>
+    </section>
+
+    <section>
+      <h2>The <code>Mysqld</code> struct</h2>
+      <pre><code class="language-go">// abridged from go/vt/mysqlctl/mysqld.go
+type Mysqld struct {
+    cnf        *Mycnf
+    dbcfgs     *dbconfigs.DBConfigs
+    mysqldPath string
+    dbaPool    *dbconnpool.ConnectionPool
+    appPool    *dbconnpool.ConnectionPool
+    // ...
+}
+
+func (m *Mysqld) Start(ctx context.Context, cnf *Mycnf, mysqldArgs ...string) error
+func (m *Mysqld) Shutdown(ctx context.Context, cnf *Mycnf, waitForMysqld bool, mysqlShutdownTimeout time.Duration) error
+func (m *Mysqld) ExecuteSuperQuery(ctx context.Context, query string) error
+func (m *Mysqld) FetchSuperQuery(ctx context.Context, query string) (*sqltypes.Result, error)</code></pre>
+      <p>Each tablet's vttablet holds a Mysqld instance for its local mysqld.</p>
+    </section>
+
+    <section>
+      <h2>my.cnf generation</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">config/mycnf/</span></span> — templates per MySQL flavor (8.0, 8.4, MariaDB).</li>
+        <li>Templates use Go's <code>text/template</code> with substitutions for paths, port, server-id, etc.</li>
+        <li>vttablet generates the cnf on first start, then re-uses it across restarts.</li>
+      </ul>
+      <p>Customize per-environment via <code>--mysql_server_extra_cnf</code> flags (don't edit the template).</p>
+    </section>
+
+    <section>
+      <h2>Backups: the boring importance</h2>
+      <ul>
+        <li>vttablet → tabletmanager <code>Backup</code> RPC → mysqlctl → backup engine.</li>
+        <li>Two engines:
+          <ul>
+            <li><strong>builtin</strong> — file-by-file copy via VReplication-style snapshot.</li>
+            <li><strong>xtrabackup</strong> — wraps Percona XtraBackup for hot backups.</li>
+          </ul>
+        </li>
+        <li>Storage abstractions:
+          <ul>
+            <li><span class="code-cite"><span class="file">filebackupstorage/</span></span> — local disk</li>
+            <li><span class="code-cite"><span class="file">gcsbackupstorage/</span></span> — Google Cloud Storage</li>
+            <li><span class="code-cite"><span class="file">azblobbackupstorage/</span></span> — Azure</li>
+            <li><span class="code-cite"><span class="file">cephbackupstorage/</span></span> — S3-compatible Ceph</li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Restore</h2>
+      <ul>
+        <li>vttablet on a fresh box detects "no data dir, but topo says there should be a tablet here".</li>
+        <li>Calls <code>RestoreFromBackup</code>: download the most recent backup, replay binlogs to catch up.</li>
+        <li>vttablet then continues as a replica.</li>
+        <li>The whole flow is what makes Vitess "self-healing": a dead replica gets reborn automatically.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Replication helpers</h2>
+      <p><span class="code-cite"><span class="file">go/vt/mysqlctl/replication.go</span></span> wraps the SQL:</p>
+      <ul>
+        <li><code>SetReplicationSource</code> → <code>CHANGE REPLICATION SOURCE TO ...</code></li>
+        <li><code>StartReplication</code> → <code>START REPLICA</code></li>
+        <li><code>StopReplication</code> → <code>STOP REPLICA</code></li>
+        <li><code>ReplicationStatus</code> → <code>SHOW REPLICA STATUS</code> parsed into a struct</li>
+        <li><code>PrimaryPosition</code> / <code>WaitForPosition</code> → GTID work</li>
+      </ul>
+      <p>The flavor abstraction (chapter 5) means these helpers Just Work on MariaDB / MySQL 5.6 / 8.x.</p>
+    </section>
+
+    <section>
+      <h2>Sidecar schema</h2>
+      <ul>
+        <li>Vitess needs a few tables in <em>your</em> mysqld for its own bookkeeping.</li>
+        <li>Examples: <code>_vt.vreplication</code>, <code>_vt.schema_migrations</code>, <code>_vt.copy_state</code>.</li>
+        <li>Managed by <span class="code-cite"><span class="file">go/vt/sidecardb/</span></span>; auto-migrates on startup.</li>
+        <li>If you're debugging VReplication or online DDL, <em>this is where the state lives</em>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>vtbackup: the standalone backup tablet</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/cmd/vtbackup/</span></span> — a one-shot binary.</li>
+        <li>Used in K8s / cron contexts: spin up a tablet, restore the latest backup, take a fresh backup, exit.</li>
+        <li>Lets you take backups without dedicating a tablet to "backup duty" full time.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">15-min walk</div>
+        <ol>
+          <li><code>cat $VTDATAROOT/vt_0000000100/my.cnf</code> — see what mysqlctl generated for one of the tablets.</li>
+          <li><code>head -50 $VTDATAROOT/vt_0000000100/data/_vt/vreplication.frm</code> — actually, do this: <code>mysql -u vt_dba -S /path/to/socket _vt -e "SHOW TABLES"</code></li>
+          <li>Read <span class="code-cite"><span class="file">go/vt/mysqlctl/mysqld.go</span></span> top to bottom — only ~600 lines of orchestration.</li>
+          <li>Run the local example's backup script: <code>./401_backup.sh</code>; watch <code>$VTDATAROOT/backups/</code>.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap of Part IV</h2>
+      <ul>
+        <li>vttablet has two halves: query path (tabletserver) and control path (tabletmanager).</li>
+        <li>VTOrc watches replication, calls vtctld to fix it.</li>
+        <li>ERS/PRS are composed from primitive tabletmanager RPCs.</li>
+        <li>mysqlctl is the layer that actually starts mysqld and runs the SQL.</li>
+      </ul>
+      <p>Part V next: sharding. The reason Vitess exists.</p>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Why is there both <code>mysqlctl</code> and <code>mysqlctld</code>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>mysqlctl</code> is a one-shot CLI useful for init/shutdown scripts. <code>mysqlctld</code> is a long-running daemon that exposes the same commands as gRPC — better in Kubernetes or environments where vttablet shouldn't fork mysqld directly.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. What's inside the <code>_vt</code> schema on every Vitess-managed mysqld?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">VReplication state (<code>_vt.vreplication</code>), online DDL state (<code>_vt.schema_migrations</code>), copy state, heartbeats. The sidecar schema is Vitess's bookkeeping inside the database it manages.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap of Part IV</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Tell apart tabletserver (queries) and tabletmanager (control).</li>
+          <li>Trace a failover end-to-end: vtorc → vtctld → DemotePrimary/PromoteReplica.</li>
+          <li>Find <code>my.cnf</code> generated for any tablet on disk.</li>
+          <li>Inspect <code>_vt</code> sidecar tables when debugging VReplication.</li>
+        </ul>
+      </div>
+      <p>Part V next: sharding. The reason Vitess exists.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/</span></span> — package overview comments</li>
+        <li><a href="https://vitess.io/docs/user-guides/backup-and-restore/" target="_blank">Vitess docs · backups</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

@@ -1,0 +1,234 @@
+{
+  "sql": {
+    "term": "SQL",
+    "def": "Structured Query Language — the language used to ask a relational database for data (SELECT) or change it (INSERT, UPDATE, DELETE)."
+  },
+  "table": {
+    "term": "Table",
+    "def": "A grid of rows and columns inside a database. Each row is one record (e.g. one customer); each column is one attribute (e.g. email)."
+  },
+  "row": {
+    "term": "Row",
+    "def": "One record in a table — a single horizontal entry."
+  },
+  "column": {
+    "term": "Column",
+    "def": "One attribute in a table — a single vertical field shared by every row."
+  },
+  "primary-key": {
+    "term": "Primary key (PK)",
+    "def": "A column (or set of columns) that uniquely identifies each row. Often an integer ID like customer_id."
+  },
+  "index": {
+    "term": "Index",
+    "def": "A side data structure that lets the database find rows by a column quickly, instead of scanning the whole table. Trade-off: faster reads, slightly slower writes."
+  },
+  "transaction": {
+    "term": "Transaction",
+    "def": "A group of SQL statements treated as one unit: either all succeed (COMMIT) or none take effect (ROLLBACK).",
+    "related": ["isolation", "acid"]
+  },
+  "acid": {
+    "term": "ACID",
+    "def": "Atomicity, Consistency, Isolation, Durability — the four guarantees a relational database provides for transactions."
+  },
+  "isolation": {
+    "term": "Isolation",
+    "def": "How much one transaction can see of another transaction's in-progress changes. MySQL's default is REPEATABLE READ — your transaction sees a consistent snapshot."
+  },
+  "mvcc": {
+    "term": "MVCC",
+    "def": "Multi-Version Concurrency Control. InnoDB keeps old versions of rows so readers don't block writers and vice versa."
+  },
+  "innodb": {
+    "term": "InnoDB",
+    "def": "The default storage engine inside MySQL. It actually stores the rows on disk, manages B+ trees, and provides ACID guarantees."
+  },
+  "btree": {
+    "term": "B+ tree",
+    "def": "The tree-shaped data structure InnoDB uses for indexes. Internal nodes store key ranges; leaf nodes store rows. Lookups are roughly log(N)."
+  },
+  "binlog": {
+    "term": "Binary log (binlog)",
+    "def": "A log file MySQL writes for every change. Other MySQLs read it to replicate. Vitess's VReplication reads it to copy or transform data.",
+    "related": ["gtid", "replication"]
+  },
+  "gtid": {
+    "term": "GTID",
+    "def": "Global Transaction ID. A unique name for every transaction, so a replica can ask any source 'give me everything after GTID X'.",
+    "related": ["binlog"]
+  },
+  "replication": {
+    "term": "Replication",
+    "def": "Copying changes from one MySQL ('primary') to one or more 'replicas' so they have a near-real-time copy of the data."
+  },
+  "primary": {
+    "term": "Primary",
+    "def": "The MySQL that accepts writes. Other MySQLs replicate from it. Sometimes called 'source' or historically 'master'."
+  },
+  "replica": {
+    "term": "Replica",
+    "def": "A read-only MySQL that follows a primary. If the primary dies, one replica is promoted."
+  },
+  "semi-sync": {
+    "term": "Semi-sync replication",
+    "def": "Variant of replication where the primary waits for at least one replica to acknowledge receipt of an event before saying COMMIT succeeded. Reduces data loss on failover."
+  },
+  "mysqld": {
+    "term": "mysqld",
+    "def": "The actual MySQL server process — a binary called 'mysqld' that listens on port 3306."
+  },
+  "wire-protocol": {
+    "term": "Wire protocol",
+    "def": "The exact bytes a MySQL client and server exchange. Vitess implements both ends in go/mysql/."
+  },
+  "pool": {
+    "term": "Connection pool",
+    "def": "A reusable set of open database connections. Opening a connection is slow; a pool lets many requests share a small number of long-lived connections."
+  },
+  "vitess": {
+    "term": "Vitess",
+    "def": "An open-source layer on top of MySQL that adds sharding, automated failover, online schema changes, and a unified entry point for apps."
+  },
+  "vtgate": {
+    "term": "vtgate",
+    "def": "Vitess's stateless query router. Apps connect to it as if it were a single MySQL; vtgate plans queries and routes them to the right shards.",
+    "related": ["planner", "vschema"]
+  },
+  "vttablet": {
+    "term": "vttablet",
+    "def": "A Vitess sidecar process colocated with each mysqld. It handles connection pooling, query rewriting, transactions, schema tracking, and reports health to vtgate."
+  },
+  "vtctld": {
+    "term": "vtctld",
+    "def": "Vitess's control-plane daemon. Operators talk to it (via vtctldclient) to create keyspaces, reshard, take backups, run online DDL, etc."
+  },
+  "vtctldclient": {
+    "term": "vtctldclient",
+    "def": "Command-line tool that sends RPCs to vtctld. The everyday admin CLI."
+  },
+  "vtorc": {
+    "term": "vtorc",
+    "def": "Vitess's failover daemon. Watches replication topology and triggers a reparent if the primary dies.",
+    "related": ["ers", "prs"]
+  },
+  "topo": {
+    "term": "Topology service (topo)",
+    "def": "A small distributed configuration store (etcd / ZooKeeper / consul) that holds the cluster's shape: keyspaces, shards, tablets, vschema, routing rules."
+  },
+  "cell": {
+    "term": "Cell",
+    "def": "One failure domain in Vitess — usually a datacenter or availability zone. Each cell has its own local topo."
+  },
+  "keyspace": {
+    "term": "Keyspace",
+    "def": "A logical database in Vitess. Contains tables. Can be unsharded (one shard) or sharded (multiple shards)."
+  },
+  "shard": {
+    "term": "Shard",
+    "def": "One slice of a sharded keyspace. Has its own primary + replicas. Named by its key range, e.g. '-80' or '80-c0'."
+  },
+  "keyrange": {
+    "term": "Keyrange",
+    "def": "The hex range a shard covers. '-80' means [00, 80); '80-' means [80, FF]. Together they tile the whole 8-byte space."
+  },
+  "keyspace-id": {
+    "term": "Keyspace ID",
+    "def": "An 8-byte value that decides which shard a row lives on. Computed from a row's column value via a vindex.",
+    "related": ["vindex", "keyrange"]
+  },
+  "vindex": {
+    "term": "Vindex",
+    "def": "Vitess Index — a function that maps a column value (like customer_id) to a keyspace ID (and therefore to a shard). Examples: hash, lookup, xxhash.",
+    "related": ["keyspace-id", "vschema"]
+  },
+  "vschema": {
+    "term": "VSchema",
+    "def": "The Vitess-side schema config that tells vtgate which tables in a keyspace are sharded, by which column, and via which vindex."
+  },
+  "vreplication": {
+    "term": "VReplication",
+    "def": "Vitess's data-movement engine. Tails one tablet's binlog and applies the rows on another. Powers MoveTables, Reshard, Materialize, OnlineDDL.",
+    "related": ["movetables", "reshard"]
+  },
+  "movetables": {
+    "term": "MoveTables",
+    "def": "A Vitess workflow that copies tables from one keyspace to another, then switches traffic over. Built on VReplication."
+  },
+  "reshard": {
+    "term": "Reshard",
+    "def": "A Vitess workflow that splits or merges shards within a keyspace. Built on VReplication."
+  },
+  "vdiff": {
+    "term": "VDiff",
+    "def": "A Vitess tool that compares rows on the source and target of a VReplication workflow to confirm they match before cutover."
+  },
+  "switchtraffic": {
+    "term": "SwitchTraffic",
+    "def": "The cutover step that moves reads (then writes) from the source of a workflow to the target. Reversible until you 'complete' the workflow."
+  },
+  "online-ddl": {
+    "term": "Online DDL",
+    "def": "Schema changes (ALTER TABLE) that happen in the background without blocking application traffic. In Vitess, often done via a VReplication-backed shadow table."
+  },
+  "throttler": {
+    "term": "Throttler",
+    "def": "An in-process service in vttablet that tells background work (VReplication, OnlineDDL) to back off when replication is lagging."
+  },
+  "ers": {
+    "term": "EmergencyReparentShard (ERS)",
+    "def": "The 'primary is dead' failover. Vitess picks the most-advanced replica, promotes it, and re-parents the others. Triggered by vtorc."
+  },
+  "prs": {
+    "term": "PlannedReparentShard (PRS)",
+    "def": "A controlled failover used during maintenance. Old primary is still alive; we drain its writes, promote a chosen replica, and update topo."
+  },
+  "rpc": {
+    "term": "RPC",
+    "def": "Remote Procedure Call — one process calls a function on another over the network. Vitess uses gRPC for almost all internal RPCs."
+  },
+  "grpc": {
+    "term": "gRPC",
+    "def": "A framework for typed RPCs over HTTP/2. Vitess defines services in .proto files under proto/, then generates Go code."
+  },
+  "protobuf": {
+    "term": "Protobuf",
+    "def": "Protocol Buffers — Google's typed serialization format. Vitess's wire schemas and topo records are protobufs."
+  },
+  "ast": {
+    "term": "AST",
+    "def": "Abstract Syntax Tree. The structured representation of parsed SQL — nodes for SELECT, WHERE, JOIN, etc. Lives in go/vt/sqlparser/."
+  },
+  "planner": {
+    "term": "Planner",
+    "def": "The vtgate component that turns parsed SQL (AST) into a plan — a tree of execution primitives that decide which shards to hit and how to combine results."
+  },
+  "primitive": {
+    "term": "Primitive",
+    "def": "An execution step inside a vtgate plan: Route, Join, Aggregate, Limit, etc. Lives in go/vt/vtgate/engine/."
+  },
+  "sysvars": {
+    "term": "System variables (sysvars)",
+    "def": "MySQL session and global settings (e.g. character_set_client). Vitess intercepts SETs and may pass them through to backends."
+  },
+  "backup": {
+    "term": "Backup",
+    "def": "A snapshot of a mysqld's data files plus a binlog position. Used to disaster-recover or to spin up new replicas."
+  },
+  "restore": {
+    "term": "Restore",
+    "def": "Reconstruct a tablet's data from a backup, then replay binlogs to catch up to 'now'."
+  },
+  "goroutine": {
+    "term": "Goroutine",
+    "def": "A lightweight thread of execution in Go. Vitess uses many of them — one per RPC, one per VReplication stream, etc."
+  },
+  "context": {
+    "term": "context.Context",
+    "def": "Go's idiomatic way to carry deadlines, cancellation, and trace info through a call chain. Every long-running Vitess function takes a Context as its first argument."
+  },
+  "interface": {
+    "term": "Go interface",
+    "def": "A named set of method signatures. Anything that has those methods automatically implements the interface — no 'implements' keyword needed."
+  }
+}

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 01 · Welcome &amp; How to Use This Tutorial</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="01" data-title="Welcome &amp; How to Use This Tutorial" data-part="Part I — MySQL from a Code Perspective" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part I · Chapter 6</div>
+      <h1>Onward to MySQL &amp; Vitess.</h1>
+      <p class="subtitle">If you've finished Part 0 (chapters 1-5), you're set. This chapter sets expectations for the rest of the course and gives you a 3-minute orientation before we dive into MySQL.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Confirm what Part 0 should already have given you.</li>
+          <li>Know how the rest of the course is structured (Parts I-VI).</li>
+          <li>Understand the "code-along" mindset for everything that follows.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>What Part 0 already taught you</h2>
+      <ul>
+        <li>How the course is structured + your study plan.</li>
+        <li>Enough SQL to read everything that follows.</li>
+        <li>What's inside a generic database (pages, indexes, locks, replication).</li>
+        <li>Enough Go to <em>read</em> Vitess source.</li>
+        <li>How to move around the repo safely.</li>
+      </ul>
+      <p>Now we apply all of that to the real systems: MySQL first, then Vitess.</p>
+    </section>
+
+    <section>
+      <h2>What you'll get from the rest of the course</h2>
+      <ul>
+        <li>A working mental model of MySQL: storage engine, <span class="g" data-term="binlog">binlog</span>, <span class="g" data-term="gtid">GTIDs</span>, wire protocol.</li>
+        <li>Where every important Vitess component lives in the repo, and what it does.</li>
+        <li>Concrete code paths for query parsing, planning, execution, and replication.</li>
+        <li>Confidence to open a "good first issue" and ship a PR that follows house style.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Not a substitute for vitess.io/docs</div>
+        Those docs are operator-focused. <em>This tutorial is code-focused.</em> Keep both open.
+      </div>
+    </section>
+
+    <section>
+      <h2>Who this is for</h2>
+      <div class="cols">
+        <div>
+          <h3>You already know (from Part 0)</h3>
+          <ul>
+            <li>Basic SQL plus what an index/transaction is</li>
+            <li>What pages, locks, and replication mean in general</li>
+            <li>Enough Go to read structs, methods, interfaces</li>
+            <li>How to navigate a repo with <code>cd</code>, <code>rg</code>, <code>git log</code></li>
+          </ul>
+        </div>
+        <div>
+          <h3>We'll teach you here</h3>
+          <ul>
+            <li>MySQL internals: binlog, GTIDs, InnoDB, wire protocol</li>
+            <li>Distributed sharding &amp; resharding</li>
+            <li>Vitess components: <span class="g" data-term="vtgate">vtgate</span>, <span class="g" data-term="vttablet">vttablet</span>, <span class="g" data-term="vtctld">vtctld</span>, <span class="g" data-term="vtorc">vtorc</span>, <span class="g" data-term="topo">topo</span></li>
+            <li>How to read and contribute Go in this style</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>How the tutorial is structured</h2>
+      <table>
+        <tr><th>Part</th><th>Chapters</th><th>Theme</th><th>Est.</th></tr>
+        <tr><td>I</td><td>1-6</td><td>MySQL from a code perspective</td><td>~90 min</td></tr>
+        <tr><td>II</td><td>7-10</td><td>Vitess at a glance</td><td>~60 min</td></tr>
+        <tr><td>III</td><td>11-15</td><td>vtgate: the query router</td><td>~120 min</td></tr>
+        <tr><td>IV</td><td>16-19</td><td>vttablet: the data plane</td><td>~80 min</td></tr>
+        <tr><td>V</td><td>20-25</td><td>Sharding & VReplication</td><td>~130 min</td></tr>
+        <tr><td>VI</td><td>26-27</td><td>Contributing</td><td>~35 min</td></tr>
+      </table>
+      <p>Total: ~8-9 hours of reading. Code-along will easily double that — recommended.</p>
+    </section>
+
+    <section>
+      <h2>How to read each chapter</h2>
+      <ul>
+        <li>Use <kbd>→</kbd> / <kbd>Space</kbd> to advance, <kbd>←</kbd> to go back.</li>
+        <li><kbd>Esc</kbd> for slide overview, <kbd>f</kbd> for fullscreen.</li>
+        <li><kbd>n</kbd> / <kbd>p</kbd> jump to next/prev chapter.</li>
+        <li><kbd>?</kbd> opens the help dialog.</li>
+        <li>Sidebar (left) tracks where you are; visited chapters get a check.</li>
+      </ul>
+      <div class="callout success">
+        <div class="callout-title">Code-along mindset</div>
+        Open <code>kalyan_docs/</code> in your browser <em>and</em> the repo in your editor.
+        Every <span class="code-cite"><span class="file">file/path.go</span>:line</span> citation is real — jump to it.
+      </div>
+    </section>
+
+    <section>
+      <h2>House conventions (quick)</h2>
+      <ul>
+        <li><strong>Code citations</strong> look like <span class="code-cite"><span class="file">go/vt/vtgate/executor.go</span>:80</span> — full path from repo root.</li>
+        <li><strong>Diagrams</strong> are Mermaid; rendered in-place.</li>
+        <li><strong>Callout boxes</strong> flag important things:</li>
+      </ul>
+      <div class="callout"><div class="callout-title">Note</div>Worth knowing.</div>
+      <div class="callout warn"><div class="callout-title">Watch out</div>Gotcha that bites people.</div>
+      <div class="callout danger"><div class="callout-title">Important</div>Don't do this.</div>
+      <div class="callout success"><div class="callout-title">Try it</div>Hands-on exercise.</div>
+    </section>
+
+    <section>
+      <h2>Why we start with MySQL</h2>
+      <p>Vitess is <em>not</em> a new database. It's a layer that sits in front of vanilla MySQL servers and orchestrates them. Without understanding MySQL's wire protocol, binary log, and replication, the Vitess code looks like magic.</p>
+      <p>Part I (chapters 2-6) is the MySQL foundation. Skim it if you're already deep on MySQL; read it twice if you're not.</p>
+      <blockquote>
+        "If you can't replicate the bug against plain MySQL, the bug probably <em>is</em> Vitess. If you can, the bug is below Vitess and you need to know what's down there."
+      </blockquote>
+    </section>
+
+    <section>
+      <h2>Try it yourself, before chapter 2</h2>
+      <div class="callout success">
+        <div class="callout-title">Warm-up</div>
+        <ol>
+          <li>From the repo root: <code>cat README.md</code></li>
+          <li>Skim <code>CLAUDE.md</code> at the repo root — it's the style guide we'll keep referring to.</li>
+          <li>Glance at the top-level layout: <code>ls go/ go/vt/ proto/</code> — don't try to understand it yet, just see the scale.</li>
+        </ol>
+      </div>
+      <p>When you're ready, hit <kbd>n</kbd> or click the next chapter in the sidebar →</p>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Why does this course start with MySQL chapters before any Vitess code?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Vitess <em>is</em> a layer above MySQL. Every Vitess subsystem (planner, vttablet, VReplication, online DDL) references binlogs, GTIDs, transactions, or the wire protocol. You can't read Vitess source without those words being concrete.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. What's the "code-along mindset"?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Read this site in one window, open the Vitess repo in your editor in another. Every code citation points at a real file. Jump to it. Reading without jumping doesn't stick.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. What was that famous quote about debugging?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">"If you can't replicate the bug against plain MySQL, the bug probably <em>is</em> Vitess. If you can, the bug is below Vitess and you need to know what's down there." The MySQL chapters teach you the "below" half.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>State why the course front-loads MySQL.</li>
+          <li>Name the six parts of the rest of the course.</li>
+          <li>Adopt the "code-along" mindset before moving on.</li>
+        </ul>
+      </div>
+      <p>Next: a tour of MySQL's architecture (server layer + InnoDB).</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><a href="https://vitess.io/docs/" target="_blank">vitess.io/docs</a> — official user-facing docs</li>
+        <li><a href="https://vitess.io/contributing/" target="_blank">vitess.io/contributing</a> — community onboarding</li>
+        <li><a href="../../CLAUDE.md" target="_blank">CLAUDE.md</a> at the repo root — coding conventions</li>
+        <li><a href="../../README.md" target="_blank">README.md</a> at the repo root</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

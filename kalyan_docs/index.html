@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Vitess Learning Tutorial</title>
+  <link rel="stylesheet" href="assets/css/style.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="sidebar-backdrop"></div>
+
+    <main class="main">
+      <div class="topbar">
+        <div>
+          <button class="menu-toggle" id="menu-toggle">☰</button>
+          <span class="topbar-title">Home</span>
+          <span class="topbar-meta">A beginner-friendly course on Vitess + MySQL</span>
+        </div>
+        <div class="topbar-actions">
+          <a href="https://github.com/vitessio/vitess" target="_blank">GitHub</a>
+          <a href="https://vitess.io/docs/" target="_blank">vitess.io docs</a>
+        </div>
+      </div>
+
+      <div class="landing">
+        <section class="hero">
+          <h1>Vitess from the inside out.</h1>
+          <p>
+            A 32-chapter, hands-on course that takes you from <strong>basic SQL</strong> to
+            confidently navigating the Vitess source code and shipping your first pull request.
+          </p>
+          <p>
+            Each chapter is a slide deck with worked examples, diagrams, hands-on labs, and a
+            checkpoint quiz. Hover any <span class="g" data-term="vitess">underlined term</span>
+            for a definition. Press <kbd>?</kbd> for keyboard shortcuts.
+          </p>
+          <p style="font-size: 0.95em; color: var(--fg-muted);">
+            <strong>Who this is for:</strong> someone who knows what <code>SELECT</code> and
+            <code>JOIN</code> are and wants to learn how a planet-scale database actually works
+            — and how to contribute to one. We assume <em>only</em> basic SQL and willingness to
+            run a few commands. We teach the rest.
+          </p>
+          <a class="cta" href="chapters/00-learning-path.html">Start with Chapter 1 →</a>
+        </section>
+
+        <section>
+          <h2 style="margin-bottom: 14px;">Pick a learning track</h2>
+          <div class="tracks">
+            <div class="track-card">
+              <h3>Beginner Full Course</h3>
+              <p>The slow, careful path. Foundations first, then MySQL, then Vitess. Aim for one
+              chapter per evening.</p>
+              <div class="track-chapters">Chapters 1 → 32 in order</div>
+            </div>
+            <div class="track-card">
+              <h3>Fast Orientation</h3>
+              <p>You already know SQL & databases. Get a map of Vitess in an afternoon, then dive
+              wherever interests you.</p>
+              <div class="track-chapters">1, 2, 7, 8, 9, 10, 27, 32</div>
+            </div>
+            <div class="track-card">
+              <h3>Query Path Track</h3>
+              <p>How does one <code>SELECT</code> become rows? Parser → planner → engine →
+              vttablet → mysqld.</p>
+              <div class="track-chapters">2, 3, 7, 12, 13, 14, 15, 17</div>
+            </div>
+            <div class="track-card">
+              <h3>Operations Track</h3>
+              <p>Replication, failover, sharding, backups. The "I get paged at 3am" path.</p>
+              <div class="track-chapters">3, 4, 7, 9, 17, 19, 22, 25, 26</div>
+            </div>
+          </div>
+        </section>
+
+        <section style="margin-top: 32px;">
+          <h2 style="margin-bottom: 18px;">Full curriculum</h2>
+          <div id="parts-grid" class="parts-grid"></div>
+        </section>
+
+        <section style="margin-top: 48px; color: var(--fg-muted); font-size: 14px;">
+          <p>
+            <strong>Tip:</strong> open this site in one window and the
+            <code>vitessio/vitess</code> repo in your editor. Every <code>file/path.go</code>
+            citation points at a real file you can jump to.
+          </p>
+          <p>
+            <strong>Stuck on a word?</strong> Hover anything with a dashed underline
+            (like <span class="g" data-term="vtgate">vtgate</span> or
+            <span class="g" data-term="binlog">binlog</span>) for an instant definition.
+            Press <kbd>g</kbd> or click the <em>Glossary</em> button in the sidebar to browse
+            every term.
+          </p>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div class="help-dialog" id="help-dialog">
+    <div class="help-content">
+      <h3>Keyboard shortcuts</h3>
+      <table>
+        <tr><td><kbd>→</kbd> / <kbd>Space</kbd></td><td>Next slide</td></tr>
+        <tr><td><kbd>←</kbd></td><td>Previous slide</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>Overview / close dialog / close drawer</td></tr>
+        <tr><td><kbd>n</kbd> / <kbd>p</kbd></td><td>Next / previous chapter</td></tr>
+        <tr><td><kbd>g</kbd></td><td>Toggle Glossary drawer</td></tr>
+        <tr><td><kbd>Cmd</kbd>/<kbd>Ctrl</kbd>+<kbd>K</kbd></td><td>Focus sidebar search</td></tr>
+        <tr><td><kbd>?</kbd></td><td>Show this help</td></tr>
+        <tr><td><kbd>PgUp</kbd> / <kbd>PgDn</kbd></td><td>Scroll within a long slide</td></tr>
+        <tr><td><kbd>f</kbd></td><td>Fullscreen</td></tr>
+      </table>
+      <p style="text-align:right; margin-top:16px;">
+        <button onclick="document.getElementById('help-dialog').classList.remove('show')">Close</button>
+      </p>
+    </div>
+  </div>
+
+  <script src="assets/js/sidebar.js"></script>
+  <script src="assets/js/glossary.js"></script>
+  <script>
+    window.addEventListener("manifest-loaded", (e) => {
+      const manifest = e.detail;
+      const grid = document.getElementById("parts-grid");
+      let html = "";
+      let n = 1;
+      for (const part of manifest) {
+        html += `<div class="part-card"><h2>${part.part}</h2><ol>`;
+        for (const ch of part.chapters) {
+          html += `<li>
+            <a href="chapters/${ch.slug}.html">
+              <span class="num">${String(n).padStart(2, "0")}</span>
+              <span>
+                <div>${ch.title}</div>
+                <div class="meta">
+                  <span class="badge ${ch.difficulty}">${ch.difficulty}</span>
+                  · ${ch.minutes} min
+                </div>
+              </span>
+            </a>
+          </li>`;
+          n++;
+        }
+        html += "</ol></div>";
+      }
+      grid.innerHTML = html;
+    });
+  </script>
+</body>
+</html>

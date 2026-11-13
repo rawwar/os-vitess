@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 24 · Throttler &amp; Traffic Management</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="24" data-title="Throttler &amp; Traffic Management" data-part="Part V — Sharding &amp; VReplication" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part V · Chapter 29</div>
+      <h1>The traffic cop.</h1>
+      <p class="subtitle">VReplication and online DDL must not break production traffic. The <span class="g" data-term="throttler">throttler</span> is the centralized "are we OK to do more work?" oracle.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Explain what the throttler does in one sentence.</li>
+          <li>Name 3+ apps that check it (VReplication, online DDL, vstreamer, ...).</li>
+          <li>Probe a tablet's throttler via HTTP.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>What it does</h2>
+      <ul>
+        <li>Watches a metric (replication lag by default).</li>
+        <li>If the metric exceeds threshold → "throttle now".</li>
+        <li>Background workloads (VReplication, online DDL, vstreamer, etc.) ask "am I throttled?" between batches.</li>
+        <li>If yes, they back off; if no, they continue.</li>
+      </ul>
+      <p>It's an in-process service inside each vttablet, with cross-tablet awareness through topo.</p>
+    </section>
+
+    <section>
+      <h2>Origins</h2>
+      <ul>
+        <li>Forked from <a href="https://github.com/github/freno">github/freno</a> — GitHub's MySQL throttling proxy.</li>
+        <li>Code: <span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/throttle/</span></span></li>
+        <li>License preserved: <span class="code-cite"><span class="file">throttle/LICENSE-freno</span></span></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Key files</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">throttler.go</span></span> — the central <code>Throttler</code> struct.</li>
+        <li><span class="code-cite"><span class="file">check.go</span></span> — the check loop (probes mysqld for lag).</li>
+        <li><span class="code-cite"><span class="file">client.go</span></span> — used by VReplication / OnlineDDL to ask "am I OK?".</li>
+        <li><span class="code-cite"><span class="file">check_result.go</span></span> — the response shape.</li>
+        <li><span class="code-cite"><span class="file">config/</span></span> — per-cluster config.</li>
+        <li><span class="code-cite"><span class="file">throttlerapp/</span></span> — app names (vreplication, online-ddl, …).</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The check loop</h2>
+      <ol>
+        <li>Every N seconds, probe each replica's <code>SHOW REPLICA STATUS</code>.</li>
+        <li>Compute <code>Seconds_Behind_Source</code> (or use heartbeat).</li>
+        <li>If any replica exceeds threshold → mark "throttled".</li>
+        <li>Clients see "throttled" on their next call until lag drops.</li>
+      </ol>
+      <p>Heartbeat-based lag is more accurate than <code>Seconds_Behind_Source</code> (which is replica-clock-dependent).</p>
+    </section>
+
+    <section>
+      <h2>Apps that check the throttler</h2>
+      <ul>
+        <li><strong>vreplication</strong> — between row batches</li>
+        <li><strong>online-ddl</strong> — between copy batches</li>
+        <li><strong>vstreamer</strong> — when serving a VStream to a third party</li>
+        <li><strong>vplayer</strong> — same engine, different role</li>
+        <li><strong>tablegc</strong> — when dropping abandoned tables</li>
+      </ul>
+      <p>Each "app name" can have its own threshold &amp; rules.</p>
+    </section>
+
+    <section>
+      <h2>The client API</h2>
+      <pre><code class="language-go">// client.go (abridged)
+type Client struct { /* ... */ }
+
+func (c *Client) ThrottleCheckOK(ctx context.Context, app string) (bool, error)
+func (c *Client) ThrottleCheckOKOrWaitAppName(ctx context.Context, appName ThrottlerAppName) error</code></pre>
+      <p>Callers pause until the throttle clears. Code-style: check between batches, not inside them.</p>
+    </section>
+
+    <section>
+      <h2>Tuning the throttler</h2>
+      <p>Operators tune via <code>vtctldclient</code>:</p>
+      <pre><code class="language-bash">vtctldclient UpdateThrottlerConfig \
+    --enable --threshold 5s \
+    --custom-query "SELECT 1 - SUM(lag) / 30 FROM heartbeat" \
+    commerce</code></pre>
+      <ul>
+        <li>Threshold: max acceptable lag.</li>
+        <li>Custom query: replace the default lag probe with anything that returns a metric.</li>
+        <li>Per-app exemptions: e.g. let online DDL run even when VReplication is throttled.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Why per-tablet, not centralized?</h2>
+      <ul>
+        <li>Centralized throttler = single point of failure + 1 extra hop in every check.</li>
+        <li>Per-tablet means: when the local tablet is healthy, no network round-trip.</li>
+        <li>Cross-tablet info comes via topo (less frequent).</li>
+      </ul>
+      <p>This is the Vitess design philosophy: keep the data plane local, push only the minimum coordination through topo.</p>
+    </section>
+
+    <section>
+      <h2>The "self-check" endpoint</h2>
+      <p>Each vttablet exposes:</p>
+      <pre><code class="language-bash">curl http://&lt;vttablet&gt;/throttler/check?app=vreplication</code></pre>
+      <p>Returns HTTP 200 if OK, 429 if throttled. Useful for debugging "why is my VReplication slow?".</p>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">15-min</div>
+        <ol>
+          <li>Hit the self-check endpoint on a tablet in your local cluster.</li>
+          <li>Open <span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/throttle/throttler.go</span></span>. Find the main loop.</li>
+          <li>Read <span class="code-cite"><span class="file">check.go</span></span> · <code>Check</code> — see how the result is computed.</li>
+          <li>Find a call to <code>ThrottleCheckOKOrWaitAppName</code> in <code>go/vt/vttablet/tabletmanager/vreplication/</code>. Notice it's between batches, not inside the inner loop.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. The throttler is per-tablet, not centralized. Why?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">A centralized throttler would be a single point of failure and a network hop on every check. Per-tablet keeps the data plane local; topo carries the rare cross-tablet info.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Where do background apps check the throttler — inside their tight loop, or between batches?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Between batches. Calling it on every row would dominate cost. Checking between, say, 1000-row chunks is plenty.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Describe the throttler's loop (probe lag → mark state → clients check).</li>
+          <li>Curl <code>/throttler/check</code> on a tablet.</li>
+          <li>Tune thresholds via <code>vtctldclient UpdateThrottlerConfig</code>.</li>
+        </ul>
+      </div>
+      <p>Next: backups. The thing you only appreciate after losing data.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/throttle/throttler.go</span></span> — package doc + main loop</li>
+        <li><a href="https://vitess.io/docs/reference/features/tablet-throttler/" target="_blank">Vitess docs · throttler</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

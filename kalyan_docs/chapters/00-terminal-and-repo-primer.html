@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 05 · Terminal &amp; Repo Primer</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="05" data-title="Terminal & Repo Primer" data-part="Part 0 — Foundations Before Vitess" style="display:none;"></div>
+
+  <div id="slides">
+
+    <section class="title-slide" id="hero">
+      <div class="part-tag">Part 0 · Chapter 5</div>
+      <h1>Move through the repo, safely.</h1>
+      <p class="subtitle">Vitess is a big repo with ~5000 Go files. Here's the small set of terminal moves you'll use every day — and the safety rules so you never accidentally destroy your local copy.</p>
+    </section>
+
+    <section id="objectives">
+      <h2>What this chapter gives you</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Navigate any repo with <code>cd</code>, <code>ls</code>, and <code>pwd</code> without thinking.</li>
+          <li>Search code with <code>rg</code> (ripgrep) — orders of magnitude faster than <code>grep</code>.</li>
+          <li>Read files with <code>less</code> / <code>bat</code> instead of needing your editor for every peek.</li>
+          <li>Inspect git history (<code>git log</code>, <code>git blame</code>, <code>git diff</code>) without modifying anything.</li>
+          <li>Know exactly which commands are safe and which can destroy uncommitted work.</li>
+        </ul>
+      </div>
+      <p>The goal of this chapter is fluency, not knowledge. You'll be running these commands hundreds of times across the rest of the course; the faster they become muscle memory, the more you'll enjoy the rest.</p>
+    </section>
+
+    <section id="safety">
+      <h2>The safety hierarchy</h2>
+      <p>Three buckets of commands. Memorize the third one — those are the only ones that can destroy work.</p>
+      <table class="compare">
+        <tr><th>Category</th><th>Commands</th></tr>
+        <tr><td>Always safe</td><td><code>ls</code>, <code>cat</code>, <code>less</code>, <code>head</code>, <code>tail</code>, <code>wc</code>, <code>rg</code>, <code>find</code>, <code>git status</code>, <code>git log</code>, <code>git diff</code>, <code>git blame</code></td></tr>
+        <tr><td>Safe-ish — read the prompt</td><td><code>git checkout &lt;file&gt;</code> (reverts uncommitted edits), <code>git stash</code>, <code>rm</code>, <code>mv</code></td></tr>
+        <tr><td>Can destroy work — be careful</td><td><code>git reset --hard</code>, <code>git clean -fd</code>, <code>git push --force</code>, <code>rm -rf</code></td></tr>
+      </table>
+      <div class="callout danger">
+        <div class="callout-title">Rule of thumb</div>
+        If a command starts with <code>git push --force</code>, <code>rm -rf</code>, or <code>git reset --hard</code>, stop and re-read the path. CLAUDE.md (the repo's contributor guide) explicitly forbids force-push to PR branches once review has started, for exactly this reason — they're irreversible on a shared branch.
+      </div>
+    </section>
+
+    <section id="navigation">
+      <h2>Navigation: the four moves</h2>
+      <p>You need four commands, total, to move around a repo:</p>
+<pre><code class="language-bash"># Where am I?
+pwd
+
+# What's here?
+ls
+ls -la                 # include hidden files (.git, .github)
+
+# Walk somewhere
+cd go/vt/vtgate
+
+# Go back up
+cd ..
+cd -                   # back to the previous directory you were in</code></pre>
+      <p>That's enough to navigate any project. The Vitess repo root has these top-level directories you'll visit constantly:</p>
+      <ul>
+        <li><code>go/</code> — all Go source. About 95% of the code lives here.</li>
+        <li><code>proto/</code> — protobuf definitions (gRPC schemas).</li>
+        <li><code>examples/local/</code> — the canonical local cluster demo.</li>
+        <li><code>kalyan_docs/</code> — this tutorial.</li>
+        <li><code>CLAUDE.md</code> — the contributor style guide. You'll re-read it more times than you expect.</li>
+      </ul>
+      <p>Pro tip: configure your shell to enable <strong>tab completion</strong>. After typing <code>cd go/vt/vtg</code>, pressing <code>Tab</code> should complete to <code>cd go/vt/vtgate/</code>. If it doesn't, your shell's autocomplete needs setup — worth fixing for the rest of this course.</p>
+    </section>
+
+    <section id="ripgrep">
+      <h2>Searching with <code>rg</code> (ripgrep)</h2>
+      <p>The single most-used command in the rest of this course will be <code>rg</code> — ripgrep, a faster, smarter grep. It respects <code>.gitignore</code>, so it won't pollute your search with build artifacts or vendored dependencies.</p>
+<pre><code class="language-bash"># Find a string anywhere in the repo
+rg "ScatterConn"
+
+# Just in .go files
+rg --type go "ScatterConn"
+
+# Just file names that match (no content search)
+rg --files | rg vtgate
+
+# Whole-word match, case-insensitive
+rg -wi "executor"
+
+# Show 3 lines of context around each match
+rg -C 3 "ScatterConn"
+
+# Search in a specific subdir
+rg "Replicate" go/vt/vttablet/
+
+# Count matches per file
+rg --count "TODO"</code></pre>
+      <div class="callout">
+        <div class="callout-title">Why not <code>grep</code>?</div>
+        <code>grep</code> works but is 10–100× slower on large repos. Worse, it'll happily search <code>node_modules</code> and binary files unless you tell it not to. <code>rg</code> is what every Vitess maintainer uses; if you ever pair with one, this is the tool you'll see them reach for first.
+      </div>
+      <p>If <code>rg</code> isn't installed: <code>brew install ripgrep</code> on macOS, <code>apt install ripgrep</code> on most Linux distros.</p>
+    </section>
+
+    <section id="reading-files">
+      <h2>Reading files without opening an editor</h2>
+      <p>You don't need to launch your editor for every quick peek at a file. Three commands cover most needs:</p>
+<pre><code class="language-bash"># Open a file in a pager (q to quit, /pattern to search, n for next)
+less go/vt/vtgate/executor.go
+
+# First 100 lines
+head -100 go/vt/vtgate/executor.go
+
+# Last 100 lines (useful for logs)
+tail -100 $VTDATAROOT/tmp/vtgate.INFO
+
+# Live-tail a log as new lines arrive
+tail -f $VTDATAROOT/tmp/vtgate.INFO</code></pre>
+      <p>Inside <code>less</code>: <kbd>q</kbd> quits, <kbd>/foo</kbd> searches forward for "foo", <kbd>n</kbd> jumps to the next match, <kbd>g</kbd> goes to the top, <kbd>G</kbd> goes to the bottom. <kbd>h</kbd> shows help. That's the whole user interface.</p>
+      <p>If you've got <code>bat</code> installed (<code>brew install bat</code>), it's <code>cat</code> with syntax highlighting and line numbers — wonderful for reading code:</p>
+<pre><code class="language-bash">bat go/vt/vtgate/executor.go</code></pre>
+      <p>And of course your editor (VS Code, Cursor, etc.) is also fine — sometimes better than a terminal pager. Use whichever is fastest in the moment.</p>
+    </section>
+
+    <section id="git-read">
+      <h2>Git: read-only commands</h2>
+      <p>Git is huge, but you only need a handful of read-only commands to learn the codebase's history.</p>
+<pre><code class="language-bash">git status              # what's changed in my checkout right now?
+git log --oneline -10   # last 10 commits, one line each
+git log --oneline --author='Sugu' -10
+git log -p path/to/file # commits PLUS their diffs for one file
+git diff                # what I've changed but not committed
+git diff main           # difference between my branch and main
+git branch --show-current</code></pre>
+      <p>None of these commands change anything. They're pure reading. Use them freely as you explore the codebase — they're often the fastest way to answer "why does this code look like this?"</p>
+      <p>One you'll especially come to love: <code>git blame</code>.</p>
+    </section>
+
+    <section id="git-blame">
+      <h2>git blame to read history</h2>
+      <p><code>git blame</code> shows, for each line in a file, the last commit that touched it. It's how you find out who wrote what — and more importantly, <em>when and why</em>.</p>
+<pre><code class="language-bash">git blame -L 100,150 go/vt/vtgate/executor.go</code></pre>
+      <p>For each of lines 100–150, you'll see the commit hash, the author, the date, and the line content. Copy the commit hash and you can dig deeper:</p>
+<pre><code class="language-bash">git show 1a2b3c4d         # full commit: message, author, all changes
+git log 1a2b3c4d -1       # just the message</code></pre>
+      <div class="callout success">
+        <div class="callout-title">How to find the "why"</div>
+        Got a confusing line? <code>git blame</code> it, get the commit hash, <code>git show</code> it. The commit message almost always answers your question — that's what messages are for. If the message is weak, look at the PR (search GitHub for the commit hash).
+      </div>
+    </section>
+
+    <section id="git-write">
+      <h2>Git: commands that change things</h2>
+      <p>These <em>do</em> modify state. Read carefully before running each one.</p>
+      <ul>
+        <li><code>git checkout -b my-branch</code> — create and switch to a new branch. Safe.</li>
+        <li><code>git add &lt;file&gt;</code> — stage a file for commit. Safe (no commit yet).</li>
+        <li><code>git commit --signoff -m "msg"</code> — record a commit. Easy to undo with <code>git reset HEAD~1</code> if you change your mind.</li>
+        <li><code>git push origin &lt;branch&gt;</code> — upload your branch to your fork. Recoverable.</li>
+        <li><code>git checkout main</code> — switch branches. Safe as long as you don't have uncommitted conflicting changes.</li>
+        <li><code>git stash</code> — set aside uncommitted changes temporarily. Reversible with <code>git stash pop</code>.</li>
+      </ul>
+      <div class="callout danger">
+        <div class="callout-title">Avoid these in this tutorial</div>
+        <code>git reset --hard</code>, <code>git push --force</code>, <code>git clean -fd</code>, and <code>rm -rf .git</code>. Each can lose uncommitted work permanently. We don't need any of them. If you accidentally make a mess, <code>git stash</code> + <code>git status</code> is almost always enough to recover.
+      </div>
+    </section>
+
+    <section id="env-vars">
+      <h2>Environment variables you'll meet</h2>
+      <p>Three environment variables drive Vitess's local development setup. They're set when you <code>source dev.env</code> (chapter 14 walks through this). For now, just know they exist:</p>
+      <ul>
+        <li><code>$VTROOT</code> — root of your Vitess source tree (usually the repo directory).</li>
+        <li><code>$VTDATAROOT</code> — where the local example stores everything stateful: etcd state, per-tablet mysqld data dirs, logs.</li>
+        <li><code>$PATH</code> — must include Vitess <code>bin/</code> so you can run <code>vtgate</code>, <code>vttablet</code>, etc. without absolute paths.</li>
+      </ul>
+      <p>You can inspect them at any time:</p>
+<pre><code class="language-bash">echo $VTROOT
+echo $VTDATAROOT
+echo $PATH | tr ':' '\n'    # print PATH one entry per line</code></pre>
+      <p>If <code>$VTDATAROOT</code> is unset, that's normal until you source <code>dev.env</code>. The local-cluster scripts in chapter 14 will set it for you.</p>
+    </section>
+
+    <section id="lab">
+      <h2>Lab: explore the repo without changing it</h2>
+      <div class="lab">
+        <div class="lab-title">15 min · read-only</div>
+        <ol>
+          <li>From the repo root: <pre><code class="language-bash">pwd && ls</code></pre></li>
+          <li>How many Go files are in the repo? <pre><code class="language-bash">rg --files --type go | wc -l</code></pre></li>
+          <li>How many files mention <code>ScatterConn</code>? <pre><code class="language-bash">rg --files-with-matches "ScatterConn" --type go | wc -l</code></pre></li>
+          <li>Who last touched <code>go/vt/vtgate/executor.go</code> line 1? <pre><code class="language-bash">git blame -L 1,1 go/vt/vtgate/executor.go</code></pre></li>
+          <li>Read the contributor style guide: <pre><code class="language-bash">less CLAUDE.md
+# press q to quit</code></pre></li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">What to notice</div>
+          <ul>
+            <li>About 5000 Go files. Vitess is large, but each file is small — usually under 1000 lines.</li>
+            <li><code>ScatterConn</code> shows up in 30+ files, which tells you it's a foundational type.</li>
+            <li>The first line of every Vitess Go file is the Apache 2.0 license header. Git blame's first line shows whichever commit added that license header originally.</li>
+            <li><code>CLAUDE.md</code> is the cheat-sheet you'll re-read whenever you forget a convention. Skim it now; come back later.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Troubleshooting cheat-sheet</h2>
+      <p>You will hit each of these at least once. Here's what to do:</p>
+      <table class="compare">
+        <tr><th>Problem</th><th>What to try</th></tr>
+        <tr><td><code>command not found: rg</code></td><td>macOS: <code>brew install ripgrep</code>. Linux: <code>apt install ripgrep</code> or <code>yum install ripgrep</code>.</td></tr>
+        <tr><td>"permission denied" running <code>./script.sh</code></td><td><code>chmod +x ./script.sh</code> then re-run.</td></tr>
+        <tr><td>"port already in use" when running examples</td><td>Old process still alive. <code>lsof -i :PORT</code> to find the PID, then <code>kill &lt;pid&gt;</code>.</td></tr>
+        <tr><td>Accidentally edited a file you shouldn't have</td><td><code>git diff &lt;file&gt;</code> to see what changed, then <code>git checkout -- &lt;file&gt;</code> to revert.</td></tr>
+        <tr><td>Lost track of many open terminal tabs</td><td>Use <code>tmux</code> or your terminal's split-window feature. Two splits — one for editor commands, one for log tailing — usually does the job.</td></tr>
+        <tr><td>"too many open files" running the local cluster</td><td><code>ulimit -n 10000</code> in your shell.</td></tr>
+      </table>
+    </section>
+
+    <section id="quiz">
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Which command searches a string across the whole repo, automatically skipping <code>.gitignore</code>'d files?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>rg "string"</code>. By default ripgrep respects <code>.gitignore</code>. Use <code>rg -u "string"</code> if you want to ignore that and search everything.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. You accidentally edited <code>CLAUDE.md</code>. How do you discard the change without committing?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>git checkout -- CLAUDE.md</code> (or in newer git: <code>git restore CLAUDE.md</code>). It reverts the file to the last commit. Confirm with <code>git status</code> — it should no longer be listed as modified.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. What's the difference between <code>git log</code> and <code>git blame</code>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>git log</code> walks commits in time order. <code>git blame</code> walks <em>per line</em>: for each line in a file, which commit last touched it. Different views of the same history.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">4. You see a confusing line in <code>go/vt/vtgate/executor.go</code>. What's the fastest way to find out why it's like that?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>git blame -L &lt;line&gt;,&lt;line&gt; go/vt/vtgate/executor.go</code> to get the commit hash, then <code>git show &lt;hash&gt;</code> to read the full message and diff. If the message is thin, search GitHub for the hash to find the PR.</div></details>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Move around the Vitess repo with <code>cd</code>, <code>ls</code>, <code>pwd</code>.</li>
+          <li>Search code fast with <code>rg</code>.</li>
+          <li>Read files in a pager and tail logs without launching your editor.</li>
+          <li>Inspect git history without modifying anything.</li>
+          <li>Recognize and avoid the small set of dangerous git commands.</li>
+        </ul>
+      </div>
+      <p>Part 0 is done. Five chapters of foundations are behind you. From chapter 6 (the original "Welcome" chapter, now positioned as part of Part I) onward, we're inside MySQL and Vitess proper. The next thing you'll learn is what MySQL is <em>really</em> doing under your SQL queries — building on every concept from chapter 3.</p>
+    </section>
+
+    <section id="further-reading">
+      <h2>Further reading</h2>
+      <ul>
+        <li><a href="https://blog.burntsushi.net/ripgrep/" target="_blank">ripgrep author's blog post</a> — engineering deep-dive on why <code>rg</code> is so fast.</li>
+        <li><a href="https://learngitbranching.js.org/" target="_blank">learngitbranching.js.org</a> — interactive git tutor; great for picturing what each command does.</li>
+        <li><a href="../../CLAUDE.md" target="_blank">CLAUDE.md</a> at the repo root — the cheat-sheet.</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

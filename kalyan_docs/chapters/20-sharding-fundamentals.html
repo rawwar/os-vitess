@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 20 · Sharding Fundamentals &amp; Vindexes</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="20" data-title="Sharding Fundamentals &amp; Vindexes" data-part="Part V — Sharding &amp; VReplication" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part V · Chapter 25</div>
+      <h1>One keyspace, many shards.</h1>
+      <p class="subtitle">Vitess's sharding is opinionated: range-based, key-space partitioning, with pluggable <span class="g" data-term="vindex">vindexes</span> for mapping a column value to a key.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Map a row to its shard given a vindex and shard layout.</li>
+          <li>Recognize the 10+ built-in vindex types and when each fits.</li>
+          <li>Read a vschema JSON and predict planner behavior.</li>
+          <li>Pick a sensible shard key and explain the trade-off.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>From one table to two shards <span class="slide-badge beginner">Mental model</span></h2>
+      <p>You have a <code>customer</code> table. You decide to shard by <code>customer_id</code>. Two shards: <code>-80</code> (covers half the key space) and <code>80-</code> (the other half).</p>
+      <div class="mermaid">
+flowchart LR
+    Insert["INSERT customer
+id=42, email=..."] --> Hash["hash(42)
+keyspace_id=0x2c..."]
+    Hash --> Decide{"0x2c &lt; 0x80?"}
+    Decide -- yes --> ShardA["shard -80
+primary + replicas"]
+    Decide -- no --> ShardB[shard 80-]
+      </div>
+      <p>The vindex maps the row's column value to an 8-byte <span class="g" data-term="keyspace-id">keyspace ID</span>. The keyspace ID picks a shard via the <span class="g" data-term="keyrange">keyrange</span>. That's the whole idea.</p>
+    </section>
+
+    <section>
+      <h2>The vocabulary</h2>
+      <table>
+        <tr><th>Term</th><th>Meaning</th></tr>
+        <tr><td>Keyspace</td><td>A logical database. Contains tables. Can be unsharded or sharded.</td></tr>
+        <tr><td>Shard</td><td>One slice of a sharded keyspace. Has its own primary + replicas.</td></tr>
+        <tr><td>Keyrange</td><td>The slice's range: <code>-80</code>, <code>80-</code>, <code>-40</code>, <code>40-80</code>, etc.</td></tr>
+        <tr><td>Vindex</td><td>"Vitess index" — a function: column value → keyspace ID (8-byte big-endian).</td></tr>
+        <tr><td>Keyspace ID</td><td>The 8-byte value used to place a row.</td></tr>
+        <tr><td>VSchema</td><td>The config: which tables have which vindexes, in which keyspace.</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>How a row is placed</h2>
+      <div class="mermaid">
+flowchart LR
+    Row[INSERT customer<br/>id=42, ...] --> Vindex[hash vindex<br/>'id']
+    Vindex --> KID[keyspace id<br/>8 bytes]
+    KID --> Range[which range<br/>contains it?]
+    Range --> Shard[shard '40-80']
+      </div>
+      <ol>
+        <li>For each <strong>primary vindex</strong> (your "shard key"), compute the keyspace ID from the row.</li>
+        <li>Look up which shard's keyrange contains that ID.</li>
+        <li>That's where the row goes.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>The keyrange</h2>
+      <ul>
+        <li>Keyranges are <strong>hex strings</strong>, half-open: <code>-80</code> = [00, 80), <code>80-</code> = [80, FF].</li>
+        <li>Sharded keyspaces split the entire 8-byte space across shards (no gaps, no overlaps).</li>
+        <li>"<code>0</code>" (or <code>-</code>) means "the whole keyrange" — for unsharded.</li>
+      </ul>
+      <pre><code class="language-text">All possible keyspace ids: 00 00 00 00 00 00 00 00  →  FF FF FF FF FF FF FF FF
+
+2-shard split:  -80   covers 00..7F FF...
+                80-   covers 80...FF FF...
+
+4-shard split:  -40   40-80   80-c0   c0-</code></pre>
+    </section>
+
+    <section>
+      <h2>Built-in vindexes</h2>
+      <ul>
+        <li><strong><code>hash</code></strong> — encrypted 3DES-based hash. Default for simple int PKs. <span class="code-cite"><span class="file">go/vt/vtgate/vindexes/hash.go</span></span></li>
+        <li><strong><code>binary</code></strong> — pass the raw bytes. For columns that are already uniform.</li>
+        <li><strong><code>binary_md5</code></strong> — md5 of bytes. For strings.</li>
+        <li><strong><code>numeric</code></strong> — column value IS the keyspace ID.</li>
+        <li><strong><code>numeric_static_map</code></strong> — file-driven lookup.</li>
+        <li><strong><code>unicode_loose_md5</code></strong> — string-aware (case-insensitive).</li>
+        <li><strong><code>xxhash</code></strong> — fast non-crypto hash.</li>
+        <li><strong><code>reverse_bits</code></strong> — for monotonically-increasing PKs (spread them around).</li>
+        <li><strong><code>lookup</code>, <code>lookup_unique</code></strong> — a separate vindex <em>table</em> maps value → keyspace ID.</li>
+        <li><strong><code>consistent_lookup</code></strong> — like lookup, but maintained transactionally.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The Vindex interface</h2>
+      <pre><code class="language-go">// abridged from go/vt/vtgate/vindexes/vindex.go
+type Vindex interface {
+    String() string
+    Cost() int
+    IsUnique() bool
+    NeedsVCursor() bool
+}
+
+type SingleColumn interface {
+    Vindex
+    Map(ctx context.Context, vcursor VCursor, ids []sqltypes.Value) ([]key.Destination, error)
+    Verify(ctx context.Context, vcursor VCursor, ids []sqltypes.Value, ksids [][]byte) ([]bool, error)
+}</code></pre>
+      <ul>
+        <li><code>Map</code> answers "for this column value, which shard(s)?"</li>
+        <li><code>Verify</code> answers "is this (value, ksid) pair correct?"</li>
+        <li><code>Cost()</code> influences planner choice when multiple vindexes apply.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Primary vs secondary (lookup) vindexes</h2>
+      <ul>
+        <li><strong>Primary</strong> — the vindex that <em>defines</em> a row's shard. Computed from a column on the row itself.</li>
+        <li><strong>Secondary</strong> — additional vindexes on the table, used to route queries that filter on a different column.</li>
+        <li>Secondary vindexes are usually <code>lookup</code>-style: a separate table maps "secondary value" → primary value (or directly to keyspace ID).</li>
+      </ul>
+      <p>Example: <code>customer</code> sharded by <code>customer_id</code> (primary <code>hash</code>); a <code>lookup</code> vindex on <code>email</code> lets <code>WHERE email = 'x'</code> still route to one shard.</p>
+    </section>
+
+    <section>
+      <h2>The vschema, in JSON</h2>
+      <pre><code class="language-json">{
+  "sharded": true,
+  "vindexes": {
+    "hash": { "type": "hash" }
+  },
+  "tables": {
+    "customer": {
+      "column_vindexes": [
+        { "column": "customer_id", "name": "hash" }
+      ]
+    },
+    "corder": {
+      "column_vindexes": [
+        { "column": "customer_id", "name": "hash" }
+      ]
+    }
+  }
+}</code></pre>
+      <p>This lives in the topo. Edit with <code>vtctldclient ApplyVSchema</code>.</p>
+    </section>
+
+    <section>
+      <h2>Reference tables &amp; sequences</h2>
+      <ul>
+        <li><strong>Reference tables</strong> — small lookup tables present on <em>every</em> shard. Cheap joins.</li>
+        <li>Configured in vschema: <code>"type": "reference"</code>.</li>
+        <li><strong>Sequences</strong> — Vitess's distributed auto-increment. A row in an unsharded sequence table; vtgate consumes it transactionally to allocate IDs.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Where the planner uses vindexes</h2>
+      <ul>
+        <li>SELECT with <code>WHERE pk_col = N</code> → planner calls <code>vindex.Map(N)</code> → one shard → <code>Route(Equal)</code>.</li>
+        <li>SELECT with <code>WHERE pk_col IN (1, 2, 3)</code> → multi-shard route, deduped.</li>
+        <li>SELECT with no vindex predicate → <code>Route(Scatter)</code>.</li>
+        <li>JOIN where both tables share the same vindex column → planner can co-locate the join on each shard.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Picking a sharding key</h2>
+      <ul>
+        <li>Most-frequent <em>WHERE column</em> on the table. (If you mostly query by <code>user_id</code>, shard by it.)</li>
+        <li>High cardinality (millions+ of distinct values).</li>
+        <li>Even distribution (avoid hot users).</li>
+        <li>Stable — changing the shard key value of a row means moving it across shards.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">One-way decision</div>
+        Changing your shard key after you have data means migrating every row. Pick carefully.
+      </div>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">20-min</div>
+        <ol>
+          <li>Open <span class="code-cite"><span class="file">go/vt/vtgate/vindexes/hash.go</span></span>. The hash uses 3DES — read why.</li>
+          <li><code>cat examples/local/vschema.json</code> after running <code>301_customer_sharded.sh</code>.</li>
+          <li>From vtgate: <code>SELECT customer_id, keyspace_id() FROM customer LIMIT 5;</code> — see the actual keyspace IDs.</li>
+          <li>Read <span class="code-cite"><span class="file">vindex.go</span></span> · the <code>Vindex</code> interface; appreciate how small it is.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Predict the shard <span class="slide-badge beginner">Practice</span></h2>
+      <div class="predict">
+        <div class="predict-title">2-shard split: <code>-80</code> and <code>80-</code>, hash vindex</div>
+        For each <code>customer_id</code>, which shard does the row land on?
+        <ul>
+          <li><code>customer_id = 1</code> → ?</li>
+          <li><code>customer_id = 42</code> → ?</li>
+          <li><code>customer_id = 1000</code> → ?</li>
+          <li><code>customer_id = 0</code> → ?</li>
+        </ul>
+      </div>
+      <div class="quiz">
+        <details>
+          <summary>Reveal the answer</summary>
+          <div class="quiz-a">
+            You can't know without computing the hash. That's the point: the hash vindex is intentionally <em>not</em> "id mod N shards" — that would put hot consecutive IDs on the same shard. The hash spreads them. To check yours, query: <code>SELECT customer_id, keyspace_id() FROM customer WHERE customer_id IN (1, 42, 1000, 0);</code> after running <code>301_customer_sharded.sh</code>.
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Why is changing the shard key after data exists a one-way decision?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Changing the shard key value of a row would move it to a different shard. With billions of rows, that's a multi-day migration with downtime risk. Pick once, very carefully.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. <code>SELECT * FROM customer WHERE email = 'a@x.com'</code>. Without a lookup vindex on email, what does vtgate do?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Scatter — send the query to every shard. With a lookup vindex on email, vtgate first queries the lookup table to find the keyspace ID, then routes to one shard.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Why is a <em>reference table</em> kept on every shard?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">So sharded queries can JOIN against it without crossing shards. Common for tiny lookup tables (country codes, product categories) where the cost of duplication is trivial.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Map column value → keyspace ID → shard in your head.</li>
+          <li>Choose between hash, lookup, and reference for a given access pattern.</li>
+          <li>Read a vschema JSON without confusion.</li>
+        </ul>
+      </div>
+      <p>Next: VReplication, the engine that moves data between shards.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/vindexes/</span></span> — every <code>*.go</code> is a vindex impl. Read 2-3 small ones.</li>
+        <li><a href="https://vitess.io/docs/reference/features/vschema/" target="_blank">Vitess docs · vschema reference</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

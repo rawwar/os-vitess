@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 13 · SQL Parser &amp; AST</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="13" data-title="SQL Parser &amp; AST" data-part="Part III — vtgate: The Query Router" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part III · Chapter 18</div>
+      <h1>Vitess has its own SQL parser.</h1>
+      <p class="subtitle">Yacc-generated, hand-tuned to match MySQL closely. The <span class="g" data-term="ast">AST</span> it produces is the lingua franca of vtgate.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Tell apart the source files (<code>ast.go</code>, <code>sql.y</code>) from the generated ones.</li>
+          <li>Read a SELECT's AST shape from the <code>Select</code> struct.</li>
+          <li>Recognize <code>Walk</code>, <code>SafeRewrite</code>, <code>Normalize</code>, and <code>Clone</code> as the four operations on ASTs.</li>
+          <li>Know what to do (and not do) when adding a new AST node.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Why a custom parser?</h2>
+      <ul>
+        <li>vtgate needs to rewrite SQL (e.g. add shard hints, push down filters). Reusing MySQL's parser means embedding C++.</li>
+        <li>A Go parser lets Vitess walk, transform, and re-print SQL freely.</li>
+        <li>The MySQL community has fragmented dialects (Aurora, Percona, MariaDB) — Vitess's parser tries to be the lowest common denominator.</li>
+        <li>Originally forked from <a href="https://github.com/youtube/vitess">YouTube/vitess</a> and continually expanded.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Two layers, one package</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/sqlparser/sql.y</span></span> — the <strong>yacc grammar</strong>. Source.</li>
+        <li><span class="code-cite"><span class="file">go/vt/sqlparser/sql.go</span></span> — generated parser. <em>Don't edit.</em></li>
+        <li><span class="code-cite"><span class="file">go/vt/sqlparser/ast.go</span></span> — handwritten AST node definitions.</li>
+        <li><span class="code-cite"><span class="file">go/vt/sqlparser/ast_funcs.go</span></span> — handwritten AST methods.</li>
+        <li>Generated walkers/cloners/formatters live in <code>ast_clone.go</code>, <code>ast_equals.go</code>, <code>ast_visit.go</code>, etc.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Calling the parser</h2>
+      <pre><code class="language-go">// Two flavors
+stmt, err := sqlparser.Parse("SELECT * FROM customer WHERE id = 1")
+
+// "Parse2" returns reserved-variable accounting (for binds)
+stmt, reservedVars, err := sqlparser.Parse2("SELECT * FROM customer WHERE id = ?")
+</code></pre>
+      <p>Returns an <code>sqlparser.Statement</code> (an interface). Switch on the concrete type:</p>
+      <pre><code class="language-go">switch s := stmt.(type) {
+case *sqlparser.Select: // ...
+case *sqlparser.Insert: // ...
+case *sqlparser.Update: // ...
+case *sqlparser.DDL:    // CREATE/ALTER/DROP
+}</code></pre>
+    </section>
+
+    <section>
+      <h2>The AST shape</h2>
+      <pre><code class="language-go">// abridged
+type Select struct {
+    Cache       *bool
+    Distinct    bool
+    StraightJoinHint bool
+    From        TableExprs
+    Comments    *ParsedComments
+    SelectExprs SelectExprs
+    Where       *Where
+    GroupBy     GroupBy
+    Having      *Where
+    OrderBy     OrderBy
+    Limit       *Limit
+    Lock        Lock
+    Into        *SelectInto
+    With        *With
+}</code></pre>
+      <div class="code-cite"><span class="file">go/vt/sqlparser/ast.go</span></div>
+      <p>Plain Go structs. Easy to read, easy to walk.</p>
+    </section>
+
+    <section>
+      <h2>Walkers: <code>Walk</code> &amp; <code>SafeRewrite</code></h2>
+      <pre><code class="language-go">// Visit every node
+err := sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+    if col, ok := node.(*sqlparser.ColName); ok {
+        fmt.Println("column:", col.Name.String())
+    }
+    return true, nil
+}, stmt)
+
+// Rewrite while walking
+result := sqlparser.SafeRewrite(stmt, nil, func(cursor *sqlparser.Cursor) bool {
+    if lit, ok := cursor.Node().(*sqlparser.Literal); ok &amp;&amp; lit.Type == sqlparser.IntVal {
+        cursor.Replace(sqlparser.NewIntLiteral("42"))
+    }
+    return true
+})</code></pre>
+      <p>Both are generated from AST struct definitions. Field order in the struct controls visit order — <strong>don't reorder casually</strong>.</p>
+    </section>
+
+    <section>
+      <h2>Formatting back to SQL</h2>
+      <pre><code class="language-go">// Re-print the AST as SQL
+buf := sqlparser.NewTrackedBuffer(nil)
+buf.Myprintf("%v", stmt)
+result := buf.String()
+
+// or use the fast path:
+result := sqlparser.String(stmt)</code></pre>
+      <ul>
+        <li><code>ast_format.go</code> — handwritten, used when you need full control.</li>
+        <li><code>ast_format_fast.go</code> — generated, optimized.</li>
+      </ul>
+      <p>Round-tripping isn't guaranteed byte-perfect — comments and whitespace can move.</p>
+    </section>
+
+    <section>
+      <h2>Normalization &amp; bind variables</h2>
+      <pre><code class="language-go">// Replace literals with bind vars (for plan cache reuse)
+stmt, reservedVars, err := sqlparser.Parse2(sql)
+sqlparser.Normalize(stmt, reservedVars, bindVarsOut)
+// SELECT * FROM t WHERE id = 1 AND name = 'kalyan'
+// →
+// SELECT * FROM t WHERE id = :vtg1 AND name = :vtg2</code></pre>
+      <div class="code-cite"><span class="file">go/vt/sqlparser/normalizer.go</span></div>
+      <ul>
+        <li>This is how vtgate gets <strong>plan cache hits</strong> across queries that only differ in literal values.</li>
+        <li>Bind vars also block SQL injection at the boundary.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Cloning &amp; equality</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/sqlparser/ast_clone.go</span></span> — <code>Clone(node)</code>, deep copy. Generated.</li>
+        <li><span class="code-cite"><span class="file">go/vt/sqlparser/ast_equals.go</span></span> — <code>Equals.SQLNode(a, b)</code>. Generated.</li>
+        <li>Both are crucial for the planner — it builds candidate plans by mutating clones and compares plans for equality during deduplication.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Adding a new AST node — the recipe</h2>
+      <ol>
+        <li>Add the struct to <code>ast.go</code>.</li>
+        <li>Add handwritten methods to <code>ast_funcs.go</code> (constructor, optional helpers).</li>
+        <li>Add grammar rules in <code>sql.y</code> that produce the new node.</li>
+        <li>Run <code>make codegen</code> — regenerates <code>sql.go</code>, walkers, cloners, formatters, cached_size.</li>
+        <li>Add a test case under <code>go/vt/sqlparser/testdata/</code> (look at existing JSON files for the format).</li>
+      </ol>
+      <div class="callout warn">
+        <div class="callout-title">Field order matters</div>
+        Generated walkers visit fields in declaration order. If your new field needs to be visited <em>before</em> something else (e.g. you set up scope before resolving names), put it first.
+      </div>
+    </section>
+
+    <section>
+      <h2>Other parser-related files</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">comments.go</span></span> — <code>/* vt+ ... */</code> hint comments</li>
+        <li><span class="code-cite"><span class="file">keywords.go</span></span> — reserved keywords table</li>
+        <li><span class="code-cite"><span class="file">analyzer.go</span></span> — quick "what kind of statement is this" (without full parse, for SQL routing fast path)</li>
+        <li><span class="code-cite"><span class="file">parsed_query.go</span></span> — pre-parsed query you can substitute bind vars into cheaply</li>
+        <li><span class="code-cite"><span class="file">literal.go</span></span> — value parsing</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">15-min walk</div>
+        <ol>
+          <li><code>head -100 go/vt/sqlparser/ast.go</code> — read the <code>SQLNode</code> interface and a few concrete types.</li>
+          <li><code>head -50 go/vt/sqlparser/sql.y</code> — see the yacc grammar declarations.</li>
+          <li><code>grep -n "type Select struct" go/vt/sqlparser/ast.go</code> — read the SELECT node.</li>
+          <li>Look at <code>go/vt/sqlparser/parse_test.go</code> — hundreds of "parse this SQL, expect this AST" pairs. Great for grokking.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>The running example, parsed</h2>
+      <p>Our query <code>SELECT c.customer_id, c.email FROM customer c WHERE c.customer_id = 42</code> becomes a <code>*sqlparser.Select</code> with roughly:</p>
+<pre><code class="language-text">Select {
+  SelectExprs: [c.customer_id, c.email]
+  From: [AliasedTableExpr{Expr: TableName{Name:"customer"}, As:"c"}]
+  Where: &Where{
+    Type: "where",
+    Expr: ComparisonExpr{
+      Operator: "=",
+      Left:  ColName{Qualifier:"c", Name:"customer_id"},
+      Right: Literal{Type: IntVal, Val: "42"},
+    },
+  },
+  Limit: nil,
+  ...
+}</code></pre>
+      <p>Notice: <code>42</code> is still a literal. Normalization will replace it with a bind variable before plan caching, so the plan for <code>id = 42</code> is reused for <code>id = 99</code>.</p>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Why does Vitess maintain its own parser instead of reusing MySQL's?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">MySQL's parser is C++ inside mysqld. Vitess needs to <em>rewrite</em> SQL (push down filters, normalize literals, route by vindex). A pure-Go parser with a walkable AST makes that easy.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. You add a new field to the <code>Select</code> struct in <code>ast.go</code>. What else must you do?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Run <code>make codegen</code>. It regenerates <code>ast_clone.go</code>, <code>ast_equals.go</code>, <code>ast_visit.go</code>, <code>ast_format_fast.go</code>, <code>cached_size.go</code>. Field order matters — walkers visit in declaration order.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. After <code>Normalize</code>, what does <code>WHERE id = 42 AND name = 'a'</code> look like?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Roughly: <code>WHERE id = :vtg1 AND name = :vtg2</code>, plus a bind-vars map <code>{"vtg1": 42, "vtg2": "a"}</code>. That's how the plan cache stays small.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Distinguish handwritten files (<code>ast.go</code>, <code>sql.y</code>) from generated.</li>
+          <li>Use <code>Walk</code>/<code>SafeRewrite</code>/<code>Normalize</code>/<code>Clone</code> by name.</li>
+          <li>Add a new AST node correctly (and re-run codegen).</li>
+        </ul>
+      </div>
+      <p>Next: how the AST becomes a plan.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/sqlparser/AGENTS.md</span></span> — package-specific contributor notes</li>
+        <li><span class="code-cite"><span class="file">go/vt/sqlparser/parse_test.go</span></span> — exhaustive examples</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

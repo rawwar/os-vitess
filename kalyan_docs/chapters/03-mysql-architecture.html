@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 03 · MySQL Architecture &amp; InnoDB Internals</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="03" data-title="MySQL Architecture &amp; InnoDB Internals" data-part="Part I — MySQL from a Code Perspective" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part I · Chapter 8</div>
+      <h1>MySQL, layer by layer.</h1>
+      <p class="subtitle">You don't need to be an <span class="g" data-term="innodb">InnoDB</span> hacker to work on Vitess — but you need to know the names and shapes of the parts, because Vitess code references them constantly.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Name the two layers of MySQL (server + storage engine) and what each owns.</li>
+          <li>Sketch a <span class="g" data-term="btree">B+ tree</span> index in 30 seconds.</li>
+          <li>Tell apart the four logs (redo, undo, binlog, slow) and who reads each.</li>
+          <li>Explain <span class="g" data-term="mvcc">MVCC</span> in one sentence — and why long transactions hurt.</li>
+          <li>Locate the matching Vitess code in <code>go/mysql/</code> and <code>go/vt/mysqlctl/</code>.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Why MySQL at all? <span class="slide-badge beginner">Beginner</span></h2>
+      <p>You picked Vitess to scale your database. So Vitess could have invented its own storage — but it didn't. It uses <strong>plain MySQL</strong> as the per-shard database, and acts as a coordinating layer above.</p>
+      <ul>
+        <li>MySQL is well-understood, well-tooled, well-tested for 25+ years.</li>
+        <li>"It's just MySQL underneath" is Vitess's competitive advantage.</li>
+        <li>That means: every MySQL feature works inside one shard. But cross-shard behavior is Vitess's job.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Throughout this chapter</div>
+        We're describing MySQL's <em>server-layer</em> behavior and <em>InnoDB</em> behavior. Both apply <strong>inside</strong> one shard. Cross-shard topics start in chapter 25.
+      </div>
+    </section>
+
+    <section>
+      <h2>MySQL is two databases in a trenchcoat</h2>
+      <div class="mermaid">
+flowchart TB
+    Client[mysql client] -->|wire protocol| Conn[Connection / Auth]
+    Conn --> Parser[Parser]
+    Parser --> Optimizer[Optimizer]
+    Optimizer --> Executor[Executor]
+    Executor --> StorageAPI[Storage Engine API]
+    subgraph engines [Pluggable Storage Engines]
+        InnoDB[(InnoDB)]
+        MyISAM[(MyISAM)]
+        Memory[(Memory)]
+    end
+    StorageAPI --> engines
+      </div>
+      <ul>
+        <li>The <strong>server layer</strong> handles connections, parsing, planning.</li>
+        <li>The <strong>storage engine layer</strong> handles actual rows, indexes, transactions.</li>
+        <li>You'll hear "InnoDB" 100&times; more than the rest — it's the default, and the only one that gives transactions.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>InnoDB: the engine you care about</h2>
+      <ul>
+        <li><strong>Row-based, transactional.</strong> ACID, MVCC, crash-safe.</li>
+        <li><strong>Clustered index on primary key.</strong> The PK <em>is</em> the table — leaf nodes contain the full row.</li>
+        <li><strong>Secondary indexes point to PKs</strong> (not to row addresses).</li>
+        <li><strong>B+ tree.</strong> 16 KB pages by default. Roughly log<sub>~100</sub>(N) levels for any lookup.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Why this matters for Vitess</div>
+        Sharding keys are usually picked to be the PK (or a prefix). Vitess's vindexes encode "given this row's PK, which shard?" — chapter 20.
+      </div>
+    </section>
+
+    <section>
+      <h2>B+ tree, drawn in 30 seconds</h2>
+      <div class="mermaid">
+flowchart TB
+    root["Root: [50, 100]"]
+    a["[10, 25, 40]"]
+    b["[60, 80]"]
+    c["[120, 200]"]
+    root --> a
+    root --> b
+    root --> c
+    a --> aL1[("PK 1-9<br/>rows")]
+    a --> aL2[("PK 10-24<br/>rows")]
+    a --> aL3[("PK 25-39<br/>rows")]
+    b --> bL1[("PK 50-59<br/>rows")]
+    b --> bL2[("PK 60-79<br/>rows")]
+      </div>
+      <ul>
+        <li>Internal nodes only hold keys; leaf nodes hold full rows.</li>
+        <li>Leaves are linked, so range scans are cheap.</li>
+        <li>Inserts can split pages — which is why bulk-insert order matters.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The four big logs you need to know</h2>
+      <table>
+        <tr><th>Log</th><th>Who writes</th><th>What it does</th></tr>
+        <tr><td><strong>Redo log</strong></td><td>InnoDB</td><td>Replay committed changes after a crash. Physical, circular.</td></tr>
+        <tr><td><strong>Undo log</strong></td><td>InnoDB</td><td>Roll back a txn; serve old row versions for MVCC reads.</td></tr>
+        <tr><td><strong>Binlog</strong></td><td>Server layer</td><td>Logical record of every write. Replication source. <strong>This is the one Vitess hooks into.</strong></td></tr>
+        <tr><td><strong>Slow log</strong></td><td>Server layer</td><td>Query > N seconds; debugging aid.</td></tr>
+      </table>
+      <div class="callout warn">
+        <div class="callout-title">Binlog is the only one Vitess truly cares about</div>
+        VReplication (chapter 21) is fundamentally "tail one tablet's binlog and apply rows to another tablet". Internalize this.
+      </div>
+    </section>
+
+    <section>
+      <h2>Transactions &amp; MVCC, mentally</h2>
+      <ul>
+        <li>InnoDB never overwrites a row in place. Updates create a new version; old versions live in <strong>undo</strong>.</li>
+        <li>Each transaction gets a snapshot at start (REPEATABLE READ by default in MySQL).</li>
+        <li>Reads find the version visible to <em>their</em> snapshot; writers don't block readers.</li>
+        <li>That's why a slow read on a busy table makes the undo segment grow — and why it can hurt write performance.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Vitess implication</div>
+        Long transactions through vtgate hold open connections in vttablet, which hold open MySQL transactions, which hold undo. <em>Don't.</em>
+      </div>
+    </section>
+
+    <section>
+      <h2>How Vitess talks about isolation</h2>
+      <ul>
+        <li>Vitess preserves MySQL isolation <em>within a shard</em>.</li>
+        <li>Across shards, default semantics are <strong>per-shard transactions</strong> — not globally atomic.</li>
+        <li>For cross-shard atomicity, Vitess supports MySQL XA / two-phase commit (2PC) — search the codebase for <code>tx_mode</code>, <code>twopc</code>, <code>dtid</code>.</li>
+        <li>2PC has cost. Most apps don't enable it. Know it exists.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>What lives where in the Vitess source</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/mysql/</span></span> — protocol, charset, decimal, datetime: everything to <em>talk to</em> a mysqld.</li>
+        <li><span class="code-cite"><span class="file">go/vt/mysqlctl/</span></span> — managing the mysqld <em>process</em> (start, stop, backup, restore).</li>
+        <li><span class="code-cite"><span class="file">go/vt/binlog/</span></span> — consuming binlog events.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/binlog_event.go</span></span> — Vitess's representation of binlog events.</li>
+      </ul>
+      <div class="callout success">
+        <div class="callout-title">Read this header</div>
+        <code>head -100 go/mysql/conn.go</code> — the docstring on the <code>Conn</code> struct explains the wire-protocol model. We cover it in chapter 5.
+      </div>
+    </section>
+
+    <section>
+      <h2>Common misconceptions</h2>
+      <div class="callout misc">
+        <div class="callout-title">"The binlog is the same as the redo log"</div>
+        No. The <strong>redo log</strong> is for crash recovery (InnoDB replays it on startup). The <strong>binlog</strong> is for replication and external consumers (other MySQLs, Vitess). Same idea — record every change — but different consumers, different formats, different writers.
+      </div>
+      <div class="callout misc">
+        <div class="callout-title">"REPEATABLE READ means I can't see other people's changes"</div>
+        Within your transaction, yes. But other people's COMMITs <em>do</em> hit the database; you just don't see them in your snapshot. The moment you start a new transaction, you'll see them.
+      </div>
+      <div class="callout misc">
+        <div class="callout-title">"MyISAM is fine, ACID isn't required"</div>
+        In 2026, just use InnoDB. MyISAM doesn't have transactions or row locks. Vitess assumes InnoDB.
+      </div>
+    </section>
+
+    <section>
+      <h2>Try it yourself <span class="slide-badge lab">Lab</span></h2>
+      <div class="lab">
+        <div class="lab-title">15 min · any MySQL instance or Docker</div>
+        <ol>
+          <li>Open a MySQL prompt: <code>mysql -uroot -p</code> (or use the Docker container from chapter 3).</li>
+          <li>Run these queries: <pre><code class="language-sql">SHOW VARIABLES LIKE '%log_bin%';
+SHOW VARIABLES LIKE '%isolation%';
+SHOW ENGINE INNODB STATUS\G</code></pre></li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">What to notice</div>
+          <ul>
+            <li><code>log_bin</code> → <code>ON</code> in MySQL 8 by default. That's the binlog being written.</li>
+            <li><code>transaction_isolation</code> → <code>REPEATABLE-READ</code>. That's the MVCC snapshot mode.</li>
+            <li>In INNODB STATUS, the <strong>BUFFER POOL AND MEMORY</strong> section shows how much page cache MySQL has and how full it is.</li>
+            <li>The <strong>TRANSACTIONS</strong> section lists every active transaction. If you ever debug "why is my Vitess shard slow?", this is the first place to look.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz <span class="slide-badge recap">Quiz</span></h2>
+      <div class="quiz">
+        <div class="quiz-q">1. The "server layer" and "storage engine" — what's owned by which?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Server layer: connection handling, auth, parsing, planning, the binlog. Storage engine (InnoDB): the actual rows on disk, the B+ tree, redo/undo logs, locks, MVCC.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Why does Vitess care more about the binlog than the redo log?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">The redo log is internal to one mysqld for crash recovery. The binlog is the external feed every other MySQL and every VReplication stream consumes. Vitess's data movement is built on tailing binlogs.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. A user opens a transaction and walks away for 4 hours. Why does that hurt the whole MySQL?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">MVCC keeps old row versions in the undo log so the open transaction can still see its snapshot. Every concurrent write piles on more old versions. The undo log balloons; performance degrades for everyone.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">4. Where in Vitess source would you start to learn how it consumes binlog events?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>go/mysql/binlog_event.go</code> (event types and interface), <code>go/mysql/binlog_event_mysql56.go</code> (parser for MySQL 5.6+ events). Chapter 4 walks through this.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap <span class="slide-badge recap">Recap</span></h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Draw MySQL as server layer + InnoDB and say what each does.</li>
+          <li>Explain why InnoDB stores rows at B+ tree leaves (clustered index).</li>
+          <li>Name the four logs and who consumes each.</li>
+          <li>Spot a long-transaction problem in the wild.</li>
+          <li>Point to the Vitess Go files that mirror these concepts.</li>
+        </ul>
+      </div>
+      <p>Next: MySQL replication and GTIDs — the pipe Vitess depends on.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li>MySQL 8.0 Reference Manual · "InnoDB Locking and Transaction Model"</li>
+        <li>Jeremy Cole's blog series "InnoDB: A journey to the core"</li>
+        <li><a href="https://github.com/vitessio/vitess/tree/main/go/mysql" target="_blank"><code>go/mysql/</code> on GitHub</a> — eyeball it, don't read it yet</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

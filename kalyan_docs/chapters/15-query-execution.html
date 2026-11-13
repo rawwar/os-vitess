@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 15 · Query Execution Engine</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="15" data-title="Query Execution Engine" data-part="Part III — vtgate: The Query Router" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part III · Chapter 20</div>
+      <h1>Plans, in motion.</h1>
+      <p class="subtitle">The engine package is small for what it does: ~50 <span class="g" data-term="primitive">primitives</span>, each implementing a tiny interface. We'll trace the most important ones.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Implement (mentally) the <code>Primitive</code> interface — it's that small.</li>
+          <li>Tell apart Route, Join, HashJoin, Aggregate by purpose.</li>
+          <li>Read <code>scatter_conn.go</code> as "fan-out a query, collect results".</li>
+          <li>Use vtgate's <code>/debug/scatter_stats</code> page to see which queries are scattering.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Our running example, executed</h2>
+      <p>For <code>SELECT c.customer_id, c.email FROM customer c WHERE c.customer_id = 42</code>, the engine just walks one <code>Route</code> primitive:</p>
+      <div class="mermaid">
+sequenceDiagram
+    participant E as Executor
+    participant R as Route primitive
+    participant V as Vindex 'hash'
+    participant SC as ScatterConn
+    participant T as vttablet (primary of -80)
+    E->>R: Execute(ctx, vcursor, bindVars)
+    R->>V: Map([42])
+    V-->>R: keyspace_id = 0x...
+    R->>R: which shard contains it? "-80"
+    R->>SC: ExecuteMultiShard([{"-80", query}])
+    SC->>T: gRPC ExecuteQuery
+    T-->>SC: rows
+    SC-->>R: result
+    R-->>E: result
+      </div>
+      <p>One vtgate function call → one shard → one row. The fast path.</p>
+    </section>
+
+    <section>
+      <h2>The <code>Primitive</code> interface</h2>
+      <pre><code class="language-go">// in go/vt/vtgate/engine/primitive.go (abridged)
+type Primitive interface {
+    GetTableName() string
+    RouteType() string
+
+    Execute(ctx context.Context, vcursor VCursor,
+        bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error)
+
+    StreamExecute(ctx context.Context, vcursor VCursor,
+        bindVars map[string]*querypb.BindVariable, wantfields bool,
+        callback func(*sqltypes.Result) error) error
+
+    GetFields(ctx context.Context, vcursor VCursor,
+        bindVars map[string]*querypb.BindVariable) (*sqltypes.Result, error)
+
+    Inputs() ([]Primitive, []map[string]any)
+    NeedsTransaction() bool
+}</code></pre>
+      <p>Every primitive — <code>Route</code>, <code>Join</code>, <code>Aggregate</code> — implements this. Tree composes by primitives holding their inputs.</p>
+    </section>
+
+    <section>
+      <h2><code>Route</code> — the leaf primitive</h2>
+      <ul>
+        <li>Holds: a parameterized SQL string + which shards to send it to.</li>
+        <li>Shards may be: <em>all</em> (scatter), <em>one</em> (selected by vindex), or <em>any one</em> (rdonly queries).</li>
+        <li>Calls <code>vcursor.ExecuteMultiShard</code>, which goes through <code>scatter_conn.go</code>.</li>
+      </ul>
+      <pre><code class="language-go">type Route struct {
+    Opcode RouteOpcode
+    Keyspace *vindexes.Keyspace
+    TargetDestination key.Destination
+    Query string  // parameterized
+    FieldQuery string  // for GetFields
+    Vindex vindexes.Vindex
+    Values []evalengine.Expr
+    // ...
+}</code></pre>
+      <div class="code-cite"><span class="file">go/vt/vtgate/engine/route.go</span></div>
+    </section>
+
+    <section>
+      <h2>RouteOpcode: how to pick shards</h2>
+      <table>
+        <tr><th>Opcode</th><th>Meaning</th></tr>
+        <tr><td><code>Unsharded</code></td><td>One unsharded keyspace, one shard</td></tr>
+        <tr><td><code>EqualUnique</code></td><td>WHERE col = N, where col has a unique vindex</td></tr>
+        <tr><td><code>Equal</code></td><td>Same, non-unique vindex (may hit multiple shards)</td></tr>
+        <tr><td><code>IN</code></td><td>WHERE col IN (...) → potentially multiple shards</td></tr>
+        <tr><td><code>Scatter</code></td><td>No vindex predicate — hit all shards</td></tr>
+        <tr><td><code>Reference</code></td><td>Reference table; any shard works</td></tr>
+        <tr><td><code>None</code></td><td>Provably zero shards (e.g. WHERE 1=0)</td></tr>
+      </table>
+      <p>The opcode controls which shards <code>Route</code> dispatches to at runtime.</p>
+    </section>
+
+    <section>
+      <h2><code>Join</code> primitive</h2>
+      <pre><code class="language-go">type Join struct {
+    Opcode JoinOpcode  // Inner, Left
+    Left   Primitive
+    Right  Primitive
+    Cols   []int      // -col = from left; +col = from right
+    Vars   map[string]int  // bind-var name → column from left
+}</code></pre>
+      <ul>
+        <li>Executes left, then for each left row sets bind vars, executes right.</li>
+        <li>"Naive join" — works because plans only emit it when nothing better exists.</li>
+        <li>Hot path code: <span class="code-cite"><span class="file">go/vt/vtgate/engine/join.go</span></span> · <code>Execute</code></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2><code>HashJoin</code></h2>
+      <ul>
+        <li>Build a hash of one side, probe with the other.</li>
+        <li>Used when the join is between two large multi-shard subqueries.</li>
+        <li>Memory cost goes up; cross-shard latency goes down.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/engine/hash_join.go</span></span></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Aggregation primitives</h2>
+      <ul>
+        <li><strong><code>ScalarAggregate</code></strong> — SUM(*), COUNT(*), no GROUP BY → one row out.</li>
+        <li><strong><code>OrderedAggregate</code></strong> — input already sorted by GROUP BY cols; stream-aggregate.</li>
+        <li><strong><code>Aggregate</code></strong> — generic, hash-aggregate fallback.</li>
+        <li>Often the planner pushes a partial aggregate into each <code>Route</code> and combines at vtgate.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Two-step aggregation</div>
+        <code>SUM(x)</code> across shards: each shard returns <code>partial_sum</code>; vtgate sums the partials. <code>AVG(x)</code> is harder — needs <code>SUM</code>+<code>COUNT</code> and divides post-aggregate.
+      </div>
+    </section>
+
+    <section>
+      <h2><code>ScatterConn</code>: the fan-out</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/scatter_conn.go</span></span></li>
+        <li>Given (keyspace, shards, query, bindvars) → fire off N parallel RPCs, collect results.</li>
+        <li>Each shard is independently retried on transient errors.</li>
+        <li>If any shard's failure is final, the whole scatter fails (or returns partial if streaming).</li>
+      </ul>
+      <pre><code class="language-go">qr, errs := scatterConn.Execute(ctx, sql, bindVars,
+    rss, // []*srvtopo.ResolvedShard
+    tabletType, session, autocommit, ignoreMaxMemoryRows)</code></pre>
+    </section>
+
+    <section>
+      <h2>Discovery &amp; HealthCheck</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/discovery/healthcheck.go</span></span> — vtgate (and others) maintain a healthcheck stream from each tablet.</li>
+        <li>For a given (keyspace, shard, tablet-type), discovery returns sorted candidates by replication lag + serving state.</li>
+        <li>The "least-lagged healthy tablet" wins.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Transactions across shards</h2>
+      <ul>
+        <li>vtgate keeps a <code>SafeSession</code> per client connection.</li>
+        <li>On first write to a shard inside a transaction, it issues <code>Begin</code> to that vttablet and remembers the txn id.</li>
+        <li>On <code>COMMIT</code>: vtgate calls <code>Commit</code> on every participating shard sequentially.</li>
+        <li>If a commit fails mid-way: <strong>partial commit</strong> (default) or 2PC if enabled.</li>
+      </ul>
+      <p><span class="code-cite"><span class="file">go/vt/vtgate/tx_conn.go</span></span></p>
+    </section>
+
+    <section>
+      <h2>The buffer (during reparents)</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/buffer/</span></span> — holds writes for a few seconds during a known reparent.</li>
+        <li>Triggered by: vtorc/vtctld broadcasting "shard primary moving"; healthcheck observing primary gone.</li>
+        <li>If reparent finishes within the window, queued requests re-execute against the new primary. Most clients never notice.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Two illustrative file walks</h2>
+      <div class="callout success">
+        <div class="callout-title">15-min Route walk</div>
+        <ol>
+          <li>Open <span class="code-cite"><span class="file">go/vt/vtgate/engine/route.go</span></span>.</li>
+          <li>Find <code>func (route *Route) Execute</code>.</li>
+          <li>Trace one branch: <code>EqualUnique</code>. See how it computes the destination shard, then hands off to <code>vcursor.ExecuteMultiShard</code>.</li>
+        </ol>
+      </div>
+      <div class="callout success">
+        <div class="callout-title">15-min Join walk</div>
+        <ol>
+          <li>Open <span class="code-cite"><span class="file">go/vt/vtgate/engine/join.go</span></span>.</li>
+          <li>Read <code>Execute</code> first. Note the for-loop over left rows.</li>
+          <li>Then <code>StreamExecute</code> — same logic, callback-shaped.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap of Part III</h2>
+      <ul>
+        <li>vtgate is a Go program with five hot paths: parse, plan, route, execute, stream.</li>
+        <li>The planner is generated logic on top of a small operator algebra.</li>
+        <li>The engine is a few dozen small primitives wired together by plans.</li>
+        <li>The scatter conn does the actual network work, with retries and discovery.</li>
+      </ul>
+      <p>Part IV next: <em>the other side</em> — vttablet, where SQL meets a real mysqld.</p>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. A Join primitive over <em>two routes</em> executes how?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Execute the left route, then for each row, set bind vars and execute the right route. It's a "nested loop join". Cheap when the left side has few rows; expensive when it doesn't (HashJoin then wins).</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. How does Vitess turn a scatter <code>SUM</code> across N shards into one result?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Planner pushes <code>SUM(x)</code> into each Route — every shard returns a partial sum. A ScalarAggregate primitive at vtgate sums the partials.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Two shards return errors during a scatter. What does vtgate do?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">If both errors are retriable (e.g. transient tablet unavailable), it retries. If one is final, the whole scatter fails with that error. Partial success doesn't bubble up to the client.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Recite the <code>Primitive</code> interface from memory.</li>
+          <li>Name 8+ primitive types and what they do.</li>
+          <li>Understand the scatter model: parallel RPCs, collected, combined.</li>
+        </ul>
+      </div>
+      <p>That's the vtgate query path. Next: <em>the other side</em> — vttablet, where SQL meets a real mysqld.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/engine/primitive.go</span></span> — interface + helpers</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/scatter_conn.go</span></span> — read top to bottom</li>
+        <li><span class="code-cite"><span class="file">go/vt/discovery/healthcheck.go</span></span> — discovery state machine</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 12 · vtgate Request Lifecycle</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="12" data-title="vtgate Request Lifecycle" data-part="Part III — vtgate: The Query Router" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part III · Chapter 17</div>
+      <h1>One query, from socket to shard.</h1>
+      <p class="subtitle">Trace a <code>SELECT</code> through vtgate, file by file. Once you've done this once, every other code path makes sense.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Trace one query through five Vitess files: <code>plugin_mysql_server.go</code> → <code>executor.go</code> → <code>plan_execute.go</code> → <code>engine/*.go</code> → <code>scatter_conn.go</code>.</li>
+          <li>Tell apart streaming vs buffered execution.</li>
+          <li>Explain what <code>SafeSession</code> tracks and why.</li>
+          <li>Find the vtgate's <code>/debug/query_plans</code> page on your local cluster.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Our running example</h2>
+      <p>For chapters 17-20 (vtgate path), we'll follow this query:</p>
+<pre><code class="language-sql">SELECT c.customer_id, c.email
+FROM customer c
+WHERE c.customer_id = 42;</code></pre>
+      <p>Each chapter shows what happens to it at one stage:</p>
+      <table class="compare">
+        <tr><th>Stage</th><th>Chapter</th></tr>
+        <tr><td>SQL text → AST</td><td>Ch 18 (parser)</td></tr>
+        <tr><td>AST → semantic info</td><td>Ch 19 (semantics + planner)</td></tr>
+        <tr><td>Semantic info → plan tree</td><td>Ch 19 (planner)</td></tr>
+        <tr><td>Plan tree → routed query on a shard</td><td>Ch 20 (engine + scatter)</td></tr>
+        <tr><td>Routed query → row back to client</td><td>This chapter (overview)</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>The 30-second version</h2>
+      <div class="mermaid">
+flowchart TB
+    A[client connects] --> B[mysql Listener]
+    B --> C[plugin_mysql_server.ComQuery]
+    C --> D[Executor.Execute]
+    D --> E[Parse SQL]
+    E --> F[Build plan]
+    F --> G[plan.execute]
+    G --> H[Engine primitives]
+    H --> I[ScatterConn → vttablets]
+    I --> J[Combine results]
+    J --> K[Stream back to client]
+      </div>
+    </section>
+
+    <section>
+      <h2>Entry point: the binary</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/cmd/vtgate/vtgate.go</span></span> — <code>main()</code>. Tiny — just imports cli and runs.</li>
+        <li><span class="code-cite"><span class="file">go/cmd/vtgate/cli/cli.go</span></span> — cobra command wiring, flag parsing.</li>
+        <li>Sets up topo, tablet healthchecks, then starts:
+          <ul>
+            <li>gRPC server (vtgate API for SDKs)</li>
+            <li>MySQL listener (for raw MySQL clients)</li>
+            <li>HTTP server (/debug, /healthz)</li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>MySQL listener: <code>plugin_mysql_server.go</code></h2>
+      <pre><code class="language-go">// abridged
+type vtgateHandler struct {
+    vtg *VTGate
+}
+
+func (vh *vtgateHandler) ComQuery(c *mysql.Conn, query string, cb func(*sqltypes.Result) error) error {
+    // ... extract session from c.UserData ...
+    return vh.vtg.executor.StreamExecute(ctx, ..., query, ..., cb)
+}</code></pre>
+      <div class="code-cite"><span class="file">go/vt/vtgate/plugin_mysql_server.go</span></div>
+      <ul>
+        <li>This is the <em>Handler</em> the <code>go/mysql</code> listener calls.</li>
+        <li>Each connection has a <code>Session</code> attached via <code>UserData</code>.</li>
+        <li>Every <code>ComQuery</code> packet drops into <code>StreamExecute</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The <code>Executor</code></h2>
+      <pre><code class="language-go">// abridged from go/vt/vtgate/executor.go
+type Executor struct {
+    serv             srvtopo.Server
+    resolver         *Resolver
+    scatterConn      *ScatterConn
+    txConn           *TxConn
+    plans            *PlanCache  // bounded LRU
+    vschema          atomic.Pointer[vindexes.VSchema]
+    vm               *VSchemaManager
+    // ...
+}
+
+func (e *Executor) Execute(ctx context.Context, mysqlCtx vtgateservice.MySQLConnection,
+        method string, safeSession *econtext.SafeSession, sql string,
+        bindVars map[string]*querypb.BindVariable, prepared bool) (*sqltypes.Result, error)</code></pre>
+      <div class="code-cite"><span class="file">go/vt/vtgate/executor.go</span></div>
+    </section>
+
+    <section>
+      <h2>Step 1: parse</h2>
+      <pre><code class="language-go">stmt, reservedVars, err := sqlparser.Parse2(sql)</code></pre>
+      <ul>
+        <li>Calls <span class="code-cite"><span class="file">go/vt/sqlparser/parser.go</span></span>.</li>
+        <li>Returns an AST node (<code>sqlparser.Statement</code>).</li>
+        <li>Errors here = malformed SQL. Bubble up as <code>INVALID_ARGUMENT</code>.</li>
+      </ul>
+      <p>We learn the parser in chapter 13.</p>
+    </section>
+
+    <section>
+      <h2>Step 2: plan</h2>
+      <pre><code class="language-go">// Roughly:
+plan, err := e.getPlan(ctx, vcursor, sql, stmt, bindVars, ...)</code></pre>
+      <ul>
+        <li>Cache lookup first — same SQL with same vschema version reuses a plan.</li>
+        <li>If miss: call <span class="code-cite"><span class="file">go/vt/vtgate/planbuilder/planner.go</span></span> · <code>BuildFromStmt</code>.</li>
+        <li>Result is an <code>engine.Plan</code> — a tree of <em>primitives</em> from <code>go/vt/vtgate/engine/</code>.</li>
+      </ul>
+      <p>Planning is the most complex part of vtgate. Chapter 14.</p>
+    </section>
+
+    <section>
+      <h2>Step 3: execute</h2>
+      <ul>
+        <li>The plan's root primitive is asked to <code>Execute</code> (or <code>StreamExecute</code>).</li>
+        <li>Primitives recursively execute their children.</li>
+        <li>The <code>Route</code> primitive is the leaf — it actually sends queries to vttablets.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/scatter_conn.go</span></span> — <code>ScatterConn</code> fan-out across shards.</li>
+      </ul>
+      <p>Chapter 15.</p>
+    </section>
+
+    <section>
+      <h2>Step 4: vttablet client</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/queryservice/</span></span> — the QueryService interface (Execute, StreamExecute, Begin, …).</li>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/grpctabletconn/</span></span> — gRPC client for that interface.</li>
+        <li>Discovery → which tablet to send to? Health-checked candidates from <span class="code-cite"><span class="file">go/vt/discovery/</span></span>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Sessions &amp; transactions</h2>
+      <ul>
+        <li>The MySQL conn has a <code>SafeSession</code>: tracks <code>InTransaction</code>, charset, autocommit, system vars.</li>
+        <li>On <code>BEGIN</code>: session flips to InTransaction; subsequent statements join the existing txn(s).</li>
+        <li>If a statement touches a new shard, vtgate starts a txn there too (and remembers it).</li>
+        <li>On <code>COMMIT</code>: vtgate commits each shard. <strong>Per-shard atomic, cross-shard best-effort.</strong> (2PC opt-in.)</li>
+      </ul>
+      <div class="code-cite"><span class="file">go/vt/vtgate/executorcontext/</span> · SafeSession</div>
+    </section>
+
+    <section>
+      <h2>Streaming vs buffered</h2>
+      <ul>
+        <li><strong>Buffered</strong> (<code>Execute</code>): collect all rows, return a <code>sqltypes.Result</code>. Simple, but memory-bounded by result size.</li>
+        <li><strong>Streaming</strong> (<code>StreamExecute</code>): push partial results to a callback as they arrive. The MySQL listener uses this — it writes packets as rows come in.</li>
+      </ul>
+      <p>Vitess prefers streaming for client-facing reads. Pulled into <code>sqltypes.ResultStream</code> internally.</p>
+    </section>
+
+    <section>
+      <h2>Errors &amp; retries</h2>
+      <ul>
+        <li>Tablet down? vtgate's discovery has alternates; the executor retries on a healthy replica.</li>
+        <li>Reparent in progress? The buffer (<span class="code-cite"><span class="file">go/vt/vtgate/buffer/</span></span>) holds writes briefly until the new primary is known.</li>
+        <li>Cross-shard partial failure with 2PC off? You get partial commit. Caller's responsibility.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">Buffer is a feature, not a bug</div>
+        For ~5 sec during reparents, vtgate will queue writes. Latency briefly spikes; correctness wins. Don't accidentally disable it.
+      </div>
+    </section>
+
+    <section>
+      <h2>What's in <code>go/vt/vtgate/</code></h2>
+      <ul>
+        <li><code>executor.go</code> — top-level entrypoint</li>
+        <li><code>plan_execute.go</code> — drives a plan</li>
+        <li><code>scatter_conn.go</code> — fan-out client</li>
+        <li><code>resolver.go</code> — keyspace/shard resolution</li>
+        <li><code>tx_conn.go</code> — transaction coordination</li>
+        <li><code>vstream_manager.go</code> — VStream subscriptions</li>
+        <li><code>plugin_mysql_server.go</code> — MySQL handler</li>
+        <li><code>vschema_manager.go</code> — watches topo for vschema changes</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">Trace a query in code</div>
+        <ol>
+          <li>Open <span class="code-cite"><span class="file">go/vt/vtgate/plugin_mysql_server.go</span></span>; find <code>ComQuery</code>.</li>
+          <li>Follow into <span class="code-cite"><span class="file">go/vt/vtgate/executor.go</span></span> · <code>StreamExecute</code>.</li>
+          <li>Read down to where it calls <code>e.getPlan</code>.</li>
+          <li>Then <code>plan.executor.execute</code>. Stop when you reach a primitive.</li>
+        </ol>
+        Aim for "I can describe what each layer does in one sentence", not "I memorized every line."
+      </div>
+    </section>
+
+    <section>
+      <h2>Guided code-reading <span class="slide-badge lab">Lab · 20 min</span></h2>
+      <div class="lab">
+        <div class="lab-title">Walk one query in source</div>
+        <ol>
+          <li>Open <span class="code-cite"><span class="file">go/vt/vtgate/plugin_mysql_server.go</span></span>. Find <code>func (vh *vtgateHandler) ComQuery</code>. Read it; that's where the MySQL listener hands off to the executor.</li>
+          <li>Follow into <span class="code-cite"><span class="file">go/vt/vtgate/executor.go</span></span>. Find <code>func (e *Executor) StreamExecute</code>. Read down to where it calls <code>e.getPlan</code>.</li>
+          <li>Inside <code>getPlan</code>, see the cache lookup. If miss, it builds a new plan via <code>planbuilder.BuildFromStmt</code>.</li>
+          <li>Find <code>plan_execute.go</code> in the same dir. Skim <code>func (e *Executor) executePlan</code>.</li>
+          <li>STOP. You don't need to understand every line — just see the layers. Each layer is a separate chapter.</li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">Goal</div>
+          You should be able to say, in one sentence per file, what each layer does — without memorizing the code.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. The MySQL listener calls <code>StreamExecute</code> (not <code>Execute</code>). Why streaming by default?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">vtgate can start writing result packets to the client as soon as the first row arrives from a vttablet — no need to buffer the whole result in memory. For large reads this matters a lot.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Where is the per-connection state (e.g., "am I in a transaction?") stored?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">In the <code>SafeSession</code> attached to the MySQL connection's <code>UserData</code>. It tracks transaction state, charset, autocommit, system variables, and the shards already participating in the current transaction.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. A vttablet briefly disappears mid-reparent. Does the client see an error?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Usually no. vtgate's <code>buffer</code> package holds writes for up to a few seconds during a known reparent. If the new primary appears in time, the queued writes execute against it. Latency spikes briefly; correctness wins.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Name the five files a query passes through inside vtgate.</li>
+          <li>Open vtgate's <code>/debug/query_plans</code> to see the live plan cache.</li>
+          <li>Explain what <code>SafeSession</code> and the buffer do.</li>
+        </ul>
+      </div>
+      <p>Next: the parser. The first real surprise — Vitess has a hand-written grammar.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/executor.go</span></span> — top of file is well-commented</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtgate/scatter_conn.go</span></span></li>
+        <li><a href="https://vitess.io/docs/concepts/vtgate/" target="_blank">Vitess docs · vtgate</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

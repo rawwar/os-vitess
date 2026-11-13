@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 26 · Testing in Vitess</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="26" data-title="Testing in Vitess" data-part="Part VI — Contributing to Vitess" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part VI · Chapter 31</div>
+      <h1>Testing.</h1>
+      <p class="subtitle">Vitess has three test tiers. Knowing which one to write — and which one to run before pushing — saves a lot of time.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Run unit tests for a single package locally.</li>
+          <li>Run planner tests and read the diff when something changes.</li>
+          <li>List e2e suites and pick the one relevant to your change.</li>
+          <li>Use <code>gofumpt</code>, <code>goimports</code>, and <code>make lint</code> as a pre-commit checklist.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>The three tiers</h2>
+      <table>
+        <tr><th>Tier</th><th>Where</th><th>Speed</th><th>What it catches</th></tr>
+        <tr><td>Unit</td><td>Co-located <code>*_test.go</code></td><td>Seconds</td><td>Logic regressions, edge cases</td></tr>
+        <tr><td>Plan</td><td><code>go/vt/vtgate/planbuilder/testdata/</code></td><td>Seconds</td><td>Planner regressions</td></tr>
+        <tr><td>End-to-end</td><td><code>go/test/endtoend/</code></td><td>Minutes</td><td>Whole-cluster behavior</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Unit tests</h2>
+      <pre><code class="language-bash"># Run tests in a single package
+go test ./go/vt/sqlparser/...
+
+# Verbose
+go test -v ./go/vt/topo/...
+
+# Specific test
+go test -run TestParse ./go/vt/sqlparser/
+
+# With race detector
+go test -race ./go/pools/...</code></pre>
+      <ul>
+        <li>Stick to <code>testify/assert</code> &amp; <code>testify/require</code> per CLAUDE.md.</li>
+        <li><code>t.Context()</code> &gt; <code>context.Background()</code>.</li>
+        <li><code>t.Cleanup</code> for teardown.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Planner tests: a special case</h2>
+      <ul>
+        <li>Located in <span class="code-cite"><span class="file">go/vt/vtgate/planbuilder/testdata/</span></span></li>
+        <li>JSON files: SQL in, expected plan out.</li>
+        <li>Test runner: <code>plan_test.go</code> in the same package.</li>
+      </ul>
+      <pre><code class="language-bash"># Update plans (after a planner change)
+go test -run TestPlan ./go/vt/vtgate/planbuilder/ -update-plans
+# Inspect the diff in testdata before committing!</code></pre>
+      <p>This is how every planner change gets reviewed — diff the testdata, see what behavior moved.</p>
+    </section>
+
+    <section>
+      <h2>End-to-end tests</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/test/endtoend/</span></span> — each subdir is a feature area.</li>
+        <li>Tests spin up a real (small) Vitess cluster, run SQL through it, check results.</li>
+        <li>Slow but high-confidence. CI runs these in matrix across MySQL flavors.</li>
+        <li>Driver script: <code>test.go</code> at repo root.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Running e2e tests</h2>
+      <pre><code class="language-bash"># List the test suites
+./test.go list
+
+# Run a specific suite locally
+./test.go -keep -- vtgate
+
+# Just compile, don't run (smoke test)
+go test -tags integration ./go/test/endtoend/vtgate/... -run xxx</code></pre>
+      <div class="callout">
+        <div class="callout-title">Slow but worth it</div>
+        Don't run all e2e tests on every push — pick the suite related to your change. CI runs the full matrix; trust CI for that.
+      </div>
+    </section>
+
+    <section>
+      <h2>The Skill: <code>.claude/skills/e2e-tests/SKILL.md</code></h2>
+      <ul>
+        <li>The repo ships a skill file at <span class="code-cite"><span class="file">.claude/skills/e2e-tests/SKILL.md</span></span> with detailed e2e-test commands.</li>
+        <li>If you're working with a Claude/Cursor agent, it'll consult this automatically.</li>
+        <li>For manual reading: <code>cat .claude/skills/e2e-tests/SKILL.md</code></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Mocks, fakes, helpers</h2>
+      <ul>
+        <li><code>memorytopo</code> — in-memory topo for tests (<span class="code-cite"><span class="file">go/vt/topo/memorytopo/</span></span>)</li>
+        <li><code>faketopo</code> — partial topo for unit tests</li>
+        <li><code>fakerpcvtgateconn</code> — fake vtgate gRPC for tablet tests</li>
+        <li><code>sandboxconn</code> — fake tabletconn (vtgate's view of a vttablet)</li>
+        <li><code>fakemysqldaemon</code> — pretends to be mysqld for mysqlctl tests</li>
+      </ul>
+      <p>Search for them when you need to stub a layer instead of standing up a real one.</p>
+    </section>
+
+    <section>
+      <h2>When in doubt: what test do I write?</h2>
+      <ul>
+        <li><strong>Fixing a planner bug:</strong> add a row to the relevant <code>testdata/*.json</code>; let plan tests fail; fix planner; re-update plans.</li>
+        <li><strong>Adding a vttablet RPC:</strong> unit test in <code>rpc_*_test.go</code>; ensure mock client works; add e2e if it crosses tablets.</li>
+        <li><strong>Adding a sysvar:</strong> unit test in <code>sysvars/</code>; planner test that confirms the SET is intercepted correctly.</li>
+        <li><strong>Touching reparent:</strong> unit test + e2e under <code>endtoend/reparent/</code>. ERS is too important to test only by hand.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Flaky tests &amp; what to do about them</h2>
+      <ul>
+        <li>Vitess CI has its share of flakes — GitHub runners are resource-starved.</li>
+        <li>CLAUDE.md rule: timeouts ≥ 30s; <code>assert.Eventually</code> not <code>time.Sleep</code>.</li>
+        <li>If a test fails sporadically: look for time-based assumptions first.</li>
+        <li>Use <code>t.Logf</code> generously when investigating — output lands in CI logs.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Coverage</h2>
+      <pre><code class="language-bash">go test -coverprofile=cover.out ./go/vt/vtgate/...
+go tool cover -html=cover.out</code></pre>
+      <p>Not enforced as a number, but PRs are expected to add tests for new behavior. "I tested it manually" isn't enough.</p>
+    </section>
+
+    <section>
+      <h2>Linters &amp; formatters</h2>
+      <pre><code class="language-bash">make lint                 # runs golangci-lint
+gofumpt -w &lt;changed-files&gt;
+goimports -local "vitess.io/vitess" -w &lt;changed-files&gt;</code></pre>
+      <p>Run these before pushing. CI will run them again; failing CI for formatting is embarrassing.</p>
+    </section>
+
+    <section>
+      <h2>Try it yourself <span class="slide-badge lab">Lab · 20 min</span></h2>
+      <div class="lab">
+        <div class="lab-title">Run real Vitess tests on your machine</div>
+        <ol>
+          <li>Run the parser's unit tests: <pre><code class="language-bash">go test ./go/vt/sqlparser/...</code></pre> Should finish in ~2 seconds.</li>
+          <li>Run the planner tests: <pre><code class="language-bash">go test -run TestPlan ./go/vt/vtgate/planbuilder/ -count 1</code></pre></li>
+          <li>List e2e suites: <pre><code class="language-bash">./test.go list | head -30</code></pre></li>
+          <li>Open a random <code>testdata/*_cases.json</code>; pick one entry; read it:<pre><code class="language-bash">ls go/vt/vtgate/planbuilder/testdata/ | head
+less go/vt/vtgate/planbuilder/testdata/select_cases.json</code></pre></li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">What to notice</div>
+          <ul>
+            <li>Plan tests are JSON pairs of SQL → expected plan. Easy to add new cases.</li>
+            <li>Unit tests are fast — sub-second per package. Run them on every save.</li>
+            <li>e2e tests are slow but high-confidence. Use selectively.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. You change the planner. Which tier breaks first?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Plan tests. Run <code>go test ./go/vt/vtgate/planbuilder/</code>. The output shows expected vs. actual JSON diff — easy to read.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. A unit test passes locally but flakes in CI. What's the most likely cause per CLAUDE.md?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">A time-based assumption: <code>time.Sleep(100*time.Millisecond)</code> or a sub-second timeout. CI runners are starved; use <code>assert.Eventually</code> with a 30s timeout instead.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Three commands you should run before every <code>git push</code>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a"><code>gofumpt -w</code>, <code>goimports -local "vitess.io/vitess" -w</code>, and the targeted unit tests for your package. Lint and full e2e can wait for CI.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Run unit tests for any package and read failures.</li>
+          <li>Run and update planner tests.</li>
+          <li>Find the right e2e suite for a given change.</li>
+          <li>Avoid the top-3 CI fail reasons (format, lint, sleep-based flakes).</li>
+        </ul>
+      </div>
+      <p>Final chapter: your first PR.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">.claude/skills/e2e-tests/SKILL.md</span></span></li>
+        <li><span class="code-cite"><span class="file">test.go</span></span> — the e2e runner</li>
+        <li>CLAUDE.md · "Test-Driven Development" section</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

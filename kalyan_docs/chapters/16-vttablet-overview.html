@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 16 · vttablet Overview</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="16" data-title="vttablet Overview" data-part="Part IV — vttablet: The Data Plane" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part IV · Chapter 21</div>
+      <h1>The MySQL sidecar.</h1>
+      <p class="subtitle"><span class="g" data-term="vttablet">vttablet</span> runs alongside every mysqld. It's the safety belt, the connection multiplexer, the schema oracle. Two big sub-packages: <code>tabletserver</code> (queries) and <code>tabletmanager</code> (control).</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Tell apart tabletserver (data plane) and tabletmanager (control plane).</li>
+          <li>Name the tablet types (PRIMARY, REPLICA, RDONLY, SPARE, DRAINED).</li>
+          <li>Point to the three pools and the schema engine.</li>
+          <li>Open a vttablet's <code>/debug/status</code> on your local cluster.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>Why vttablet exists</h2>
+      <ul>
+        <li>vtgate must not connect to mysqld directly — too many connections, too much logic at the wrong layer.</li>
+        <li>vttablet adds: pooling, query rewriting, schema watching, throttling, replication tracking, hot row protection.</li>
+        <li>It also serves the "tablet manager" RPCs vtctld/vtorc use to do cluster ops.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">Mental model</div>
+        Think of vttablet as "MySQL's bodyguard". It refuses bad queries, retries reasonable ones, and tells vtgate exactly which queries this mysqld is healthy enough to serve.
+      </div>
+    </section>
+
+    <section>
+      <h2>Tablet types</h2>
+      <ul>
+        <li><strong>PRIMARY</strong> — the writable replica for a shard.</li>
+        <li><strong>REPLICA</strong> — read-only replicas, ready to be promoted.</li>
+        <li><strong>RDONLY</strong> — read-only replicas, <em>not</em> for promotion. Used for OLAP-y queries, backups, VReplication sources.</li>
+        <li><strong>SPARE</strong> — not serving.</li>
+        <li><strong>DRAINED</strong> — also not serving.</li>
+      </ul>
+      <p>Tablet type is stored in the topo and changed by RPC. vtgate filters discovery by tablet type when picking targets.</p>
+    </section>
+
+    <section>
+      <h2>The two halves</h2>
+      <div class="mermaid">
+flowchart TB
+    subgraph vttablet
+        TabletServer[tabletserver<br/>QueryService impl]
+        TabletManager[tabletmanager<br/>TabletManager RPC]
+        StateManager[state manager<br/>tablet type transitions]
+    end
+    VTGate -->|QueryService| TabletServer
+    VTCtld -->|TabletManager| TabletManager
+    VTOrc -->|TabletManager| TabletManager
+    TabletServer -.shares state.- StateManager
+    TabletManager -.controls.- StateManager
+    TabletServer --> MySQL[(mysqld)]
+    TabletManager --> MySQL
+      </div>
+    </section>
+
+    <section>
+      <h2>tabletserver: the query path</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/tabletserver.go</span></span> — top-level wiring.</li>
+        <li>Implements <span class="code-cite"><span class="file">go/vt/vttablet/queryservice/</span></span> · <code>QueryService</code>.</li>
+        <li>Sub-engines:
+          <ul>
+            <li><span class="code-cite"><span class="file">query_engine.go</span></span> — plans + executes queries against mysqld</li>
+            <li><span class="code-cite"><span class="file">tx_engine.go</span></span> — transaction lifecycle</li>
+            <li><span class="code-cite"><span class="file">schema/</span></span> — schema tracking</li>
+            <li><span class="code-cite"><span class="file">heartbeat/</span></span> — primary writes heartbeats; replicas measure lag</li>
+            <li><span class="code-cite"><span class="file">throttle/</span></span> — throttling for online DDL, VReplication</li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>vttablet's own planner</h2>
+      <ul>
+        <li>Surprise: vttablet has its <em>own</em> mini-planner.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/planbuilder/</span></span></li>
+        <li>It doesn't shard — vtgate did that. vttablet's planner rewrites for safety:
+          <ul>
+            <li>Add <code>LIMIT</code> caps</li>
+            <li>Detect "passthrough DML" vs. "needs subquery rewrite"</li>
+            <li>Recognize types (DDL, DML, SELECT, set) for routing to the right pool</li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The connection pools (recap)</h2>
+      <ul>
+        <li><strong>Conn pool</strong> — for read-only queries.</li>
+        <li><strong>Tx pool</strong> — for transactions (numbered, by txid).</li>
+        <li><strong>Appserver pool</strong> — for DBA / heartbeat / control queries.</li>
+        <li>Sizes controlled by flags; tunable per environment.</li>
+      </ul>
+      <div class="code-cite"><span class="file">go/vt/vttablet/tabletserver/connpool/</span></div>
+    </section>
+
+    <section>
+      <h2>The schema engine</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/schema/engine.go</span></span></li>
+        <li>Reads <code>information_schema</code> at startup, caches table definitions in memory.</li>
+        <li>Subscribes to its own change events; refreshes after DDL.</li>
+        <li>Used by query planner ("does this table have column X?") and online DDL.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Health streamer</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/health_streamer.go</span></span></li>
+        <li>Streams real-time health updates to vtgate's discovery.</li>
+        <li>Carries: tablet type, replication lag, serving state, last seen GTID position.</li>
+        <li>If this stream goes silent, vtgate marks the tablet "unhealthy" and stops routing to it.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>State manager</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/state_manager.go</span></span></li>
+        <li>Owns the tablet's "what type am I + am I serving" state machine.</li>
+        <li>Coordinated transitions:
+          <ul>
+            <li>PRIMARY → REPLICA (demotion during reparent) — drain transactions, stop accepting writes</li>
+            <li>REPLICA → PRIMARY (promotion) — wait for replication caught up, enable writes</li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Query rule engine</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/rules/</span></span></li>
+        <li>Operators can install rules: "block queries matching pattern X", "rate-limit pattern Y".</li>
+        <li>Push-button incident response — kill all queries from a runaway service.</li>
+        <li>Configured via vtctldclient; persisted in topo or memory.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Where vttablet's RPCs live</h2>
+      <ul>
+        <li><strong>QueryService</strong> (vtgate ↔ vttablet):
+          <ul>
+            <li><span class="code-cite"><span class="file">go/vt/vttablet/queryservice/</span></span> — interface</li>
+            <li><span class="code-cite"><span class="file">go/vt/vttablet/grpcqueryservice/</span></span> — gRPC server impl</li>
+            <li><span class="code-cite"><span class="file">go/vt/vttablet/grpctabletconn/</span></span> — gRPC client</li>
+          </ul>
+        </li>
+        <li><strong>TabletManager</strong> (vtctld/vtorc ↔ vttablet):
+          <ul>
+            <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletmanager/rpc_*.go</span></span> — implementations</li>
+            <li><span class="code-cite"><span class="file">go/vt/vttablet/grpctmclient/</span></span> + <code>grpctmserver/</code></li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">20-min walk</div>
+        <ol>
+          <li>From your local cluster: <code>curl http://&lt;vttablet-host&gt;:&lt;port&gt;/debug/status</code></li>
+          <li>The page lists: tablet type, serving state, pools, schemas. This is the vttablet "console".</li>
+          <li>Open <span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/tabletserver.go</span></span> top. Note the explicit lifecycle: <code>Start()</code>, <code>StartService()</code>, <code>Stop()</code>.</li>
+          <li>Read <span class="code-cite"><span class="file">query_engine.go</span></span> · <code>NewQueryEngine</code> — see how the pools are wired up.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. PRIMARY vs REPLICA vs RDONLY — what's the operational difference between REPLICA and RDONLY?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Both are read-only and follow the primary. REPLICA is eligible for promotion in a failover. RDONLY is <em>not</em> — it's reserved for OLAP queries, VReplication sources, and backups, so failover candidates aren't disturbed.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. vttablet runs its own mini-planner. What does it do that vtgate's planner doesn't?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">It rewrites queries for safety (add LIMIT caps, recognize DDL vs DML), and routes the query to the right pool. No sharding logic — vtgate already decided that.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. The health streamer goes silent. What happens?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">vtgate's discovery marks this tablet "unhealthy" and stops routing to it. Other tablets pick up the load. If enough go silent simultaneously, vtgate runs out of healthy candidates.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Describe vttablet's job in one sentence (MySQL safety belt + multiplexer).</li>
+          <li>Find tabletserver vs tabletmanager dirs.</li>
+          <li>Inspect a vttablet's <code>/debug/status</code> on your local cluster.</li>
+        </ul>
+      </div>
+      <p>Next: the tabletmanager RPCs vtctld uses to drive cluster ops.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vttablet/tabletserver/</span></span> — sub-package doc comments</li>
+        <li><a href="https://vitess.io/docs/concepts/vttablet/" target="_blank">Vitess docs · vttablet</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 05 · The MySQL Wire Protocol in Go</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="05" data-title="The MySQL Wire Protocol in Go" data-part="Part I — MySQL from a Code Perspective" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part I · Chapter 10</div>
+      <h1>Speaking MySQL.</h1>
+      <p class="subtitle"><span class="g" data-term="vtgate">vtgate</span> has to <em>pretend</em> to be MySQL, and <span class="g" data-term="vttablet">vttablet</span> has to <em>talk to</em> MySQL. Both halves live in <code>go/mysql/</code>.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Explain what a <span class="g" data-term="wire-protocol">wire protocol</span> is using fewer than three sentences.</li>
+          <li>Recognize the 4-byte MySQL packet header in a hex dump.</li>
+          <li>Find <code>go/mysql/conn.go</code> and identify the <code>Conn</code> struct.</li>
+          <li>Locate where vtgate's <strong>server</strong> role is implemented (<code>plugin_mysql_server.go</code>).</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>What is the "wire protocol"?</h2>
+      <ul>
+        <li>A binary, length-prefixed packet format over TCP (port 3306) or a Unix socket.</li>
+        <li>Stateful: handshake → auth → query/response loop → close.</li>
+        <li>Documented at <a href="https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html" target="_blank">dev.mysql.com</a> — but you almost never need to read the official doc once you've read Vitess's implementation.</li>
+      </ul>
+      <p>Vitess implements <em>both sides</em>: a server (listener) for vtgate, and a client (Conn) for talking to mysqld.</p>
+    </section>
+
+    <section>
+      <h2>The packet, in one slide</h2>
+      <pre><code class="language-text">+----------+----------+----------+----------+--- ... ---+
+|  length  |  length  |  length  | sequence |  payload  |
+|  byte 0  |  byte 1  |  byte 2  |   id     |  N bytes  |
++----------+----------+----------+----------+--- ... ---+
+        24-bit little-endian            1 byte    up to (2^24 - 1)
+</code></pre>
+      <ul>
+        <li>Header = 4 bytes: 3 for length, 1 for sequence number.</li>
+        <li>Sequence wraps at 256, reset every command.</li>
+        <li>Payloads &gt; 16 MB split into multiple packets.</li>
+      </ul>
+      <div class="code-cite"><span class="file">go/mysql/conn.go</span> — <code>const PacketHeaderSize = 4</code></div>
+    </section>
+
+    <section>
+      <h2>The <code>Conn</code> struct (the heart of <code>go/mysql/</code>)</h2>
+      <pre><code class="language-go">// Conn is a connection between a client and a server, using the MySQL
+// binary protocol. It is built on top of an existing net.Conn, that
+// has already been established.
+//
+// Use Connect on the client side to create a connection.
+// Use NewListener to create a server side and listen for connections.
+type Conn struct {
+    fields []*querypb.Field
+    salt   []byte
+    authPluginName AuthMethodDescription
+    schemaName string
+    // ... bufio reader/writer, ephemeral buffers, mutex, etc.
+}</code></pre>
+      <div class="code-cite"><span class="file">go/mysql/conn.go</span>:75</div>
+      <ul>
+        <li><strong>Same struct, both sides.</strong> Client and server share buffering, packet framing, charset handling.</li>
+        <li><strong>Ephemeral buffer reuse</strong> — see the <code>ephemeralRead</code> / <code>ephemeralWrite</code> state to avoid allocations on every packet.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Server side: <code>Listener</code></h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/mysql/server.go</span></span> — <code>NewListener()</code>, <code>Listener.Accept()</code>, dispatches each connection to a Handler.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/server.go</span></span> — also defines the <code>Handler</code> interface (ComQuery, ComPrepare, etc.).</li>
+        <li>Auth: pluggable via <span class="code-cite"><span class="file">go/mysql/auth_server.go</span></span>. <code>AuthServerStatic</code> (file-based), <code>AuthServerClientCert</code> (mTLS), or "none".</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">In Vitess</div>
+        vtgate's <span class="code-cite"><span class="file">go/vt/vtgate/plugin_mysql_server.go</span></span> implements <code>mysql.Handler</code> and routes <code>ComQuery</code> calls into the planner+executor. We trace this in chapter 12.
+      </div>
+    </section>
+
+    <section>
+      <h2>Client side: <code>Connect()</code></h2>
+      <pre><code class="language-go">// Connect creates a connection to a server.
+// It then handles the initial handshake.
+func Connect(ctx context.Context, params *ConnParams) (*Conn, error)</code></pre>
+      <div class="code-cite"><span class="file">go/mysql/client.go</span></div>
+      <ul>
+        <li><strong>ConnParams</strong> — host, port, user, password, db, TLS, etc. (<span class="code-cite"><span class="file">go/mysql/conn_params.go</span></span>)</li>
+        <li>Used by vttablet when it opens connections to its mysqld.</li>
+        <li>Used by test helpers, vtctld, anywhere Vitess needs to talk to a MySQL.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The query loop, in pseudocode</h2>
+      <pre><code class="language-go">// server side, simplified
+for {
+    pkt, err := c.readEphemeralPacket()
+    if err != nil { return }
+    switch pkt[0] {
+    case ComQuery:
+        // 1-byte command, rest is SQL
+        sql := string(pkt[1:])
+        handler.ComQuery(c, sql, func(qr *sqltypes.Result) error {
+            return c.writeResult(qr)
+        })
+    case ComStmtPrepare:  // ...
+    case ComStmtExecute:  // ...
+    case ComPing:         // ...
+    case ComQuit:         return
+    }
+}</code></pre>
+      <p>That's it. Everything else is variations: result encoding, prepared statements, COM_BINLOG_DUMP, etc.</p>
+    </section>
+
+    <section>
+      <h2>Result encoding (server → client)</h2>
+      <ol>
+        <li>Column count packet (LengthEncoded int).</li>
+        <li>N column-definition packets (name, type, flags).</li>
+        <li>EOF or OK (depending on capability flags).</li>
+        <li>0+ row packets (one row per packet).</li>
+        <li>EOF.</li>
+      </ol>
+      <div class="code-cite"><span class="file">go/mysql/query.go</span> — see <code>writeFields</code>, <code>writeRow</code>, <code>writeEndResult</code></div>
+      <p>Vitess uses <code>sqltypes.Result</code> internally and converts at the boundary.</p>
+    </section>
+
+    <section>
+      <h2>Flavor: handling MySQL vs MariaDB vs Percona</h2>
+      <ul>
+        <li>Different servers, mostly the same protocol — but binlog events, GTID format, and a few sysvars differ.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/flavor.go</span></span> — the <code>flavor</code> interface; one impl per vendor.</li>
+        <li><span class="code-cite"><span class="file">go/mysql/flavor_mysql.go</span></span>, <code>flavor_mariadb.go</code>, <code>flavor_percona.go</code>.</li>
+      </ul>
+      <div class="callout">
+        <div class="callout-title">House rule (from CLAUDE.md)</div>
+        Version-specific behavior <em>belongs in the flavor file</em>, not in generic code. If you find yourself writing <code>if isMariaDB</code> in <code>conn.go</code>, stop — add it to the flavor instead.
+      </div>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">15-min code walk</div>
+        Open <span class="code-cite"><span class="file">go/mysql/conn.go</span></span> and find:
+        <ol>
+          <li><code>type Conn struct</code> — read the field comments.</li>
+          <li><code>func (c *Conn) readPacket()</code> — see header parsing.</li>
+          <li><code>func (c *Conn) writeEphemeralPacket()</code> — the zero-alloc write path.</li>
+        </ol>
+        Don't read top to bottom; jump around. The file is 1800 lines, but the key ideas live in ~300.
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Vitess implements both sides of the MySQL protocol. Why both?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">vtgate <em>speaks MySQL</em> to apps (as a server). vttablet (and vtgate's internal client) <em>talks MySQL</em> to mysqld (as a client). The protocol code is symmetric, so the same Conn struct serves both roles.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. What does the <code>Handler</code> interface in <code>go/mysql/server.go</code> let you do?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Plug different "what to do when a SQL packet arrives" handlers into the same MySQL listener. vtgate plugs in a handler that routes the query into its planner+executor. Tests plug in a fake.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. Why does flavor logic live in <code>flavor_mysql.go</code> / <code>flavor_mariadb.go</code> rather than in <code>conn.go</code>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">CLAUDE.md rule: MySQL-version-specific behavior belongs in the flavor implementation, not generic code. Otherwise <code>conn.go</code> would be a swamp of <code>if isMariaDB</code> branches.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Describe the 4-byte packet header without looking it up.</li>
+          <li>Point to <code>go/mysql/conn.go</code> as the heart of both client and server roles.</li>
+          <li>Find vtgate's MySQL handler in <code>go/vt/vtgate/plugin_mysql_server.go</code>.</li>
+          <li>Use the flavor abstraction without branching on vendor.</li>
+        </ul>
+      </div>
+      <p>Next: connection pooling — the layer above raw <code>Conn</code> that keeps Vitess from melting under load.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><a href="https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html" target="_blank">Official MySQL protocol docs</a></li>
+        <li><span class="code-cite"><span class="file">go/mysql/conn_test.go</span></span> — end-to-end protocol tests; great for seeing examples</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

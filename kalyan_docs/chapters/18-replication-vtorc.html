@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 18 · Replication Management &amp; VTOrc</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="18" data-title="Replication Management &amp; VTOrc" data-part="Part IV — vttablet: The Data Plane" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part IV · Chapter 23</div>
+      <h1>The autopilot.</h1>
+      <p class="subtitle"><span class="g" data-term="vtorc">VTOrc</span> detects bad replication topologies and fixes them. It's the part of Vitess that wakes you up less.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Describe vtorc's loop: probe → analyze → act.</li>
+          <li>Name 3+ anomaly types vtorc reacts to.</li>
+          <li>Connect vtorc to the tabletmanager RPCs from the previous chapter.</li>
+          <li>Find vtorc's HTTP UI on your local cluster.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>What VTOrc does</h2>
+      <ul>
+        <li>Probes every tablet's MySQL frequently.</li>
+        <li>Builds an in-memory model of the replication topology.</li>
+        <li>Detects anomalies: dead primary, broken replication, demoted primary, replication lag.</li>
+        <li>Decides on a recovery (PRS or ERS), then calls vtctld to do it.</li>
+      </ul>
+      <p>It's a Vitess-flavored fork of <a href="https://github.com/openark/orchestrator">openark/orchestrator</a>, an older MySQL-only tool.</p>
+    </section>
+
+    <section>
+      <h2>VTOrc layout</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/cmd/vtorc/</span></span> — binary entrypoint</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtorc/inst/</span></span> — "instance" model (tablet + MySQL state)</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtorc/db/</span></span> — SQLite-backed state cache</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtorc/logic/</span></span> — the heart: discovery, analysis, recovery</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtorc/process/</span></span> — leadership election (only one VTOrc acts at a time)</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtorc/server/</span></span> — HTTP/RPC for the UI &amp; API</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Discovery loop</h2>
+      <div class="mermaid">
+flowchart LR
+    Topo[(topo)] --> Discover[every N seconds<br/>discover tablets]
+    Discover --> Probe[probe each tablet's mysqld]
+    Probe --> Store[update SQLite cache]
+    Store --> Analyze[analyze anomalies]
+    Analyze --> Decide{recovery needed?}
+    Decide -- yes --> Act[call vtctld]
+    Decide -- no --> Discover
+      </div>
+      <p>Defaults: ~5s discovery interval, ~10s probe. Tunable.</p>
+    </section>
+
+    <section>
+      <h2>The anomaly catalog</h2>
+      <p>Search for <code>AnalysisCode</code> in <span class="code-cite"><span class="file">go/vt/vtorc/inst/analysis.go</span></span>. A few:</p>
+      <ul>
+        <li><code>DeadPrimary</code> — primary can't be probed; replicas confirm they can't reach it either</li>
+        <li><code>DeadPrimaryAndReplicas</code> — even worse</li>
+        <li><code>ReplicaIsWritable</code> — read_only flipped off; suspicious</li>
+        <li><code>NotConnectedToPrimary</code> — replica thinks it has no source</li>
+        <li><code>ReplicationStopped</code> — IO/SQL threads stopped</li>
+      </ul>
+      <p>For each, there's a recovery action.</p>
+    </section>
+
+    <section>
+      <h2>Recovery decisions</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtorc/logic/topology_recovery.go</span></span> — the dispatcher.</li>
+        <li>For <code>DeadPrimary</code>: call ERS on the shard.</li>
+        <li>For <code>ReplicaIsWritable</code>: set <code>read_only = ON</code>.</li>
+        <li>For <code>ReplicationStopped</code>: try <code>START REPLICA</code>; escalate if it fails.</li>
+        <li>Cooldowns prevent thrash — VTOrc won't retry the same shard for X seconds after a recovery.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>ERS, in code</h2>
+      <ul>
+        <li>VTOrc doesn't reimplement reparent — it calls vtctld.</li>
+        <li>vtctld implementation: <span class="code-cite"><span class="file">go/vt/vtctl/reparentutil/emergency_reparenter.go</span></span></li>
+        <li>Skeleton:
+          <ol>
+            <li>Lock the shard in topo.</li>
+            <li>Stop replication on all reachable replicas; collect positions.</li>
+            <li>Pick the most-advanced replica (deterministic tie-break).</li>
+            <li>Promote it (set read_only=OFF, update topo).</li>
+            <li>Re-parent the rest to it.</li>
+            <li>Update the shard record's primary alias.</li>
+            <li>Unlock.</li>
+          </ol>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Why "most-advanced replica" matters</h2>
+      <ul>
+        <li>With async replication, replicas lag the primary.</li>
+        <li>When the primary dies suddenly, each replica is at a different GTID.</li>
+        <li>Promoting a less-advanced replica = data loss (transactions on the dead primary are gone).</li>
+        <li>Semi-sync helps: at least one replica had the data when the primary acked the client.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">Read this in code</div>
+        <span class="code-cite"><span class="file">go/vt/vtctl/reparentutil/util.go</span></span> · the helper that chooses the candidate. Pay attention to the explicit tie-breaks.
+      </div>
+    </section>
+
+    <section>
+      <h2>Leadership: only one VTOrc decides</h2>
+      <ul>
+        <li>You typically run 3 VTOrcs per cluster for HA.</li>
+        <li>They elect a leader via topo (etcd lease, ZK ephemeral, …).</li>
+        <li>Only the leader probes &amp; acts; followers stand by.</li>
+        <li>If the leader dies, a follower takes over within seconds.</li>
+      </ul>
+      <p>See <span class="code-cite"><span class="file">go/vt/vtorc/process/election.go</span></span>.</p>
+    </section>
+
+    <section>
+      <h2>Vitess vs. classical Orchestrator</h2>
+      <ul>
+        <li>Classical Orchestrator: works on raw MySQLs, no notion of "Vitess shard".</li>
+        <li>VTOrc: aware of Vitess tablet types &amp; topo; calls vtctld, not direct MySQL DDL.</li>
+        <li>Removes the "split brain with another reparent tool" risk.</li>
+        <li>If you ever inherit a Vitess + Orchestrator hybrid: migrate to VTOrc.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>The HTTP UI</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtorc/server/</span></span> serves a small HTML UI at <code>/web/</code>.</li>
+        <li>Shows current topology, recent recoveries, anomalies.</li>
+        <li>Great for "why did failover happen at 3am" forensics.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">20-min walk</div>
+        <ol>
+          <li>Find VTOrc's port in your local cluster: <code>cat $VTDATAROOT/tmp/vtorc.INFO | head -20</code></li>
+          <li>Open <code>http://localhost:&lt;port&gt;/api/cluster-info</code> — JSON of cluster state.</li>
+          <li>Read <span class="code-cite"><span class="file">go/vt/vtorc/logic/topology_recovery.go</span></span> top: see the recovery dispatch table.</li>
+          <li><strong>Simulate a failure</strong>: kill the primary tablet (<code>kill &lt;pid&gt;</code>); watch VTOrc fail over within ~30s.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Lab: simulate a failover <span class="slide-badge lab">Lab · 15 min</span></h2>
+      <div class="lab">
+        <div class="lab-title">Kill a primary, watch vtorc recover</div>
+        <ol>
+          <li>With local cluster up, find the primary tablet: <pre><code class="language-bash">vtctldclient GetTablets --keyspace commerce | grep primary</code></pre></li>
+          <li>Tail vtorc's log: <pre><code class="language-bash">tail -f $VTDATAROOT/tmp/vtorc.INFO</code></pre></li>
+          <li>In another terminal, find the primary's PID and kill it: <pre><code class="language-bash">ps aux | grep vttablet_0000000100 | grep -v grep
+kill &lt;pid&gt;</code></pre></li>
+          <li>Within ~30 seconds, vtorc detects the dead primary, runs ERS, promotes a replica.</li>
+          <li>Re-check tablets: <pre><code class="language-bash">vtctldclient GetTablets --keyspace commerce | grep primary</code></pre> Now a different tablet is primary.</li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">What to notice in vtorc's log</div>
+          Look for lines mentioning <code>DeadPrimary</code> → <code>RecoverDeadPrimary</code> → <code>PromoteReplica</code>. That's the analysis-decision-action chain.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. How many vtorcs run in production, and why?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Usually 3 for HA. Only one is leader (via topo leadership election); the others stand by. If the leader dies, a follower takes over within seconds — same model as etcd or Kubernetes controllers.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. After a recovery, vtorc enters a cooldown for the affected shard. Why?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Prevents thrash. If the just-promoted primary briefly looks unhealthy (network blip), a cooldown stops vtorc from immediately re-failing-over. Stability > speed of reaction.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Describe vtorc's main loop.</li>
+          <li>Cause a failover yourself by killing the primary process.</li>
+          <li>Read vtorc's log lines and match them to ERS phases.</li>
+        </ul>
+      </div>
+      <p>Next: mysqlctl, the daemon that actually starts and stops mysqld.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtctl/reparentutil/</span></span> — read <code>emergency_reparenter.go</code> top to bottom; it's well-commented</li>
+        <li><a href="https://vitess.io/docs/concepts/vtorc/" target="_blank">Vitess docs · vtorc</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 22 · Resharding &amp; MoveTables</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="22" data-title="Resharding &amp; MoveTables" data-part="Part V — Sharding &amp; VReplication" style="display:none;"></div>
+
+  <div id="slides">
+    <section class="title-slide">
+      <div class="part-tag">Part V · Chapter 27</div>
+      <h1>Live data, moving.</h1>
+      <p class="subtitle"><span class="g" data-term="movetables">MoveTables</span> ships rows between keyspaces. <span class="g" data-term="reshard">Reshard</span> splits or merges shards. Same VReplication engine, different shapes.</p>
+    </section>
+
+    <section>
+      <h2>Learning objectives</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Walk the workflow lifecycle (create → copy → catchup → vdiff → switch → complete).</li>
+          <li>Run a full MoveTables in the local example.</li>
+          <li>Understand why <span class="g" data-term="vdiff">VDiff</span> happens <em>before</em> switching traffic.</li>
+          <li>Know the difference between switchtraffic (reversible) and complete (final).</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>The lifecycle of a workflow</h2>
+      <div class="mermaid">
+flowchart LR
+    Create[create workflow] --> Copy[copy phase<br/>RDONLY queries]
+    Copy --> Catchup[catchup<br/>tail binlog]
+    Catchup --> VDiff[vdiff verify]
+    VDiff --> SwitchR[switchtraffic<br/>rdonly + replica]
+    SwitchR --> SwitchW[switchtraffic<br/>primary]
+    SwitchW --> Complete[complete<br/>or cancel]
+      </div>
+      <p>Every workflow follows this shape. The only thing that changes is the source/target topology.</p>
+    </section>
+
+    <section>
+      <h2>MoveTables: cross-keyspace copy</h2>
+      <pre><code class="language-bash">vtctldclient MoveTables \
+    --workflow commerce2customer \
+    --target-keyspace customer create \
+    --source-keyspace commerce \
+    --tables "customer,corder"</code></pre>
+      <ul>
+        <li>Source: <em>all shards</em> of <code>commerce</code></li>
+        <li>Target: <em>all shards</em> of <code>customer</code></li>
+        <li>For each target shard, one VReplication workflow pulls rows from each source shard that matches the new shard's keyrange.</li>
+      </ul>
+      <p>Code path: <span class="code-cite"><span class="file">go/vt/vtctl/workflow/server.go</span></span> · <code>MoveTablesCreate</code> → builds the VReplication rows → calls each target tablet's <code>CreateVReplicationWorkflow</code>.</p>
+    </section>
+
+    <section>
+      <h2>Reshard: same-keyspace split/merge</h2>
+      <pre><code class="language-bash">vtctldclient Reshard \
+    --workflow cust2cust \
+    --target-keyspace customer create \
+    --source-shards '0' \
+    --target-shards '-80,80-'</code></pre>
+      <ul>
+        <li>Source shard <code>0</code> (the whole range) → target shards <code>-80</code> + <code>80-</code>.</li>
+        <li>VReplication rows on each target shard tail the source shard's binlog.</li>
+        <li>Filter: <code>WHERE keyspace_id IN this_target_range</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>SwitchTraffic — the cutover</h2>
+      <ol>
+        <li><strong>switchtraffic --tablet-types "rdonly,replica"</strong> first.
+          <ul>
+            <li>Routes <em>reads</em> to the target.</li>
+            <li>Reversible — if you see issues, you can switch back.</li>
+          </ul>
+        </li>
+        <li>Confirm metrics look good.</li>
+        <li><strong>switchtraffic --tablet-types primary</strong>.
+          <ul>
+            <li>Briefly freezes writes on source primary.</li>
+            <li>Waits for VReplication to catch up (zero lag).</li>
+            <li>Flips routing rules in topo so writes go to target.</li>
+            <li>Sets source to read-only.</li>
+          </ul>
+        </li>
+        <li>If anything is wrong, <code>reverse-traffic</code> brings writes back.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>The cutover, in code</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtctl/workflow/server.go</span></span> — main workflow logic.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtctl/workflow/switcher.go</span></span> — the cutover state machine.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtctl/workflow/stream_migrator.go</span></span> — moves <em>existing</em> VReplication streams across reshards.</li>
+        <li>Routing rules are updated in topo (<span class="code-cite"><span class="file">RoutingRulesFile</span></span>, <span class="code-cite"><span class="file">ShardRoutingRulesFile</span></span>).</li>
+        <li>vtgate's vschema watcher picks up the new rules and re-routes.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Complete vs cancel</h2>
+      <ul>
+        <li><strong>Complete</strong> — workflow is permanent.
+          <ul>
+            <li>Stops VReplication streams.</li>
+            <li>For MoveTables: deletes source tables.</li>
+            <li>For Reshard: marks source shards inactive (you delete with <code>DeleteShards</code>).</li>
+          </ul>
+        </li>
+        <li><strong>Cancel</strong> — undo, source remains canonical.</li>
+      </ul>
+      <div class="callout warn">
+        <div class="callout-title">Reversibility window</div>
+        Between "switchtraffic primary" and "complete", the source is still in sync but read-only. <em>That</em> is your "if everything explodes, flip back" window. Don't <code>complete</code> until you're sure.
+      </div>
+    </section>
+
+    <section>
+      <h2>Reverse VReplication</h2>
+      <ul>
+        <li>After SwitchTraffic, Vitess automatically creates a <em>reverse</em> workflow.</li>
+        <li>Target binlog → Source mysqld. Keeps source warm in case you need to fall back.</li>
+        <li>Lives in <code>_vt.vreplication</code> on the source.</li>
+        <li>Removed by <code>complete</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Routing rules in motion</h2>
+      <p>Before switchtraffic, vtgate routes <code>customer</code> table queries to <code>commerce.customer</code>. After:</p>
+      <pre><code class="language-json">{
+  "rules": [
+    {
+      "from_table": "commerce.customer",
+      "to_tables": ["customer.customer"]
+    }
+  ]
+}</code></pre>
+      <p>So even if your app still writes <code>commerce.customer</code>, the query lands on the new keyspace.</p>
+    </section>
+
+    <section>
+      <h2>Materialize</h2>
+      <ul>
+        <li>Long-running VReplication workflow that maintains a derived table.</li>
+        <li>Source: a SQL query. Target: a materialized view stored as a real table.</li>
+        <li>Use cases: denormalized reads, cross-shard aggregates, search indexes.</li>
+        <li><span class="code-cite"><span class="file">go/vt/vtctl/workflow/materializer.go</span></span></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Worth knowing: throttler interplay</h2>
+      <ul>
+        <li>VReplication is throttled by the same engine used for online DDL.</li>
+        <li>If a primary mysqld is busy, the throttler tells VReplication to back off.</li>
+        <li>Lag can grow during throttle; usually catches up after.</li>
+      </ul>
+      <p>Chapter 24 covers the throttler in depth.</p>
+    </section>
+
+    <section>
+      <h2>Try it yourself</h2>
+      <div class="callout success">
+        <div class="callout-title">45-min lab</div>
+        Run the full demo end-to-end:
+        <ol>
+          <li><code>./201_customer_tablets.sh</code> — empty customer keyspace</li>
+          <li><code>./202_move_tables.sh</code> — kick off MoveTables</li>
+          <li>Watch <code>_vt.vreplication</code> on target while inserting data on source via vtgate</li>
+          <li>vdiff: verify</li>
+          <li><code>./203_switch_reads.sh</code>, <code>./204_switch_writes.sh</code></li>
+          <li><code>vtctldclient MoveTables ... complete</code></li>
+          <li>Reshard: <code>./301-305</code></li>
+        </ol>
+      </div>
+    </section>
+
+    <section>
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. Why does Vitess auto-create a reverse VReplication workflow on cutover?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">So you can roll back. Until you <code>complete</code> the workflow, the source still has live, in-sync data. If post-cutover monitoring spots a problem, <code>reverse-traffic</code> flips writes back to the source within seconds.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Why does SwitchTraffic for primaries briefly freeze writes?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">To wait for VReplication to fully drain the source binlog onto the target. Once the target is at the same GTID as the source, vtgate flips the routing rules. Total freeze is usually seconds.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. What does VDiff actually <em>do</em>?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Streams rows from both source and target in PK order, side-by-side, comparing each. Reports mismatches; never writes. Always run before <code>complete</code>.</div></details>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>List the workflow lifecycle steps in order.</li>
+          <li>Run a real MoveTables in the local example.</li>
+          <li>Reverse a cutover (until <code>complete</code>).</li>
+          <li>Spot which file in <code>go/vt/vtctl/workflow/</code> handles each stage.</li>
+        </ul>
+      </div>
+      <p>Next: online DDL — schema changes without downtime.</p>
+    </section>
+
+    <section>
+      <h2>Further reading</h2>
+      <ul>
+        <li><span class="code-cite"><span class="file">go/vt/vtctl/workflow/server.go</span></span> — the workflow surface</li>
+        <li><a href="https://vitess.io/docs/reference/vreplication/movetables/" target="_blank">Vitess docs · MoveTables</a></li>
+        <li><a href="https://vitess.io/docs/reference/vreplication/reshard/" target="_blank">Vitess docs · Reshard</a></li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>

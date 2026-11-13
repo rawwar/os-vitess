@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script>(function(){var m=(localStorage.getItem('vitess-tutorial-view')||'docs')==='slides'?'slides':'docs';document.documentElement.classList.add(m+'-mode');if(localStorage.getItem('vitess-tutorial-sidebar-hidden')==='1')document.documentElement.classList.add('sidebar-hidden');})();</script>
+  <title>Ch 01 · Your Learning Path</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+  <link id="reveal-theme" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css" />
+  <link rel="stylesheet" href="../assets/css/style.css" />
+</head>
+<body>
+  <div id="chapter-meta" data-chapter="01" data-title="Your Learning Path" data-part="Part 0 — Foundations Before Vitess" style="display:none;"></div>
+
+  <div id="slides">
+
+    <section class="title-slide" id="hero">
+      <div class="part-tag">Part 0 · Chapter 1</div>
+      <h1>Your learning path.</h1>
+      <p class="subtitle">Welcome. Before we touch any code, let's set realistic expectations, pick a pace, and confirm your setup works. Read this once — it'll save you days later.</p>
+    </section>
+
+    <section id="objectives">
+      <h2>What this chapter gives you</h2>
+      <div class="objectives">
+        <div class="objectives-title">By the end of this chapter, you will</div>
+        <ul>
+          <li>Understand the three-layer journey this course takes you on.</li>
+          <li>Have picked a 7-day or 14-day study schedule.</li>
+          <li>Know how to read each chapter — sections, badges, callouts, glossary, two view modes.</li>
+          <li>Have run the warm-up command to confirm your environment is ready.</li>
+        </ul>
+      </div>
+      <p>This chapter is short — about 10 minutes of reading. Everything that follows builds on it, so don't skip the warm-up lab at the end.</p>
+    </section>
+
+    <section id="three-layers">
+      <h2>Where this course takes you</h2>
+      <p><span class="g" data-term="vitess">Vitess</span> is not a new database. It is a layer that sits in front of plain MySQL servers and orchestrates them — routing queries, managing replication, copying rows between shards, handling failovers. To read its source code well, you need to understand three things in order: the database concepts Vitess <em>depends on</em>, the MySQL internals it <em>builds on</em>, and the Vitess components that <em>tie them together</em>.</p>
+      <div class="mermaid">
+flowchart TB
+    Foundations[Foundations<br/>SQL · DB internals · Go reading · Terminal]
+    MySQL[MySQL internals<br/>indexes · binlog · replication · protocol]
+    Vitess[Vitess<br/>vtgate · vttablet · sharding · workflows]
+    Foundations --> MySQL
+    MySQL --> Vitess
+      </div>
+      <p>Most readers won't keep all of it in their head on first pass. That's expected. The way to learn a complex system is to revisit the same idea from three different angles — once when you meet it, once when you see it in code, once when you debug it — until it sticks. Every part of this course is designed to be revisited.</p>
+      <p>By the time you reach Part VI (Contributing to Vitess), you should be comfortable opening any file in <code>go/vt/</code> and figuring out roughly what it does. That's the bar.</p>
+    </section>
+
+    <section id="who-this-is-for">
+      <h2>Who this is for</h2>
+      <p>This course assumes very little. You need to have written a <code>SELECT</code> with a <code>WHERE</code> clause, you need to be reasonably comfortable in a terminal, and you need to be able to clone a Git repo and run a shell script. That's it.</p>
+      <p>You do <strong>not</strong> need to know Go. You do not need to know MySQL internals. You do not need any background in distributed systems. You certainly do not need to have used Vitess before. If you have any of that, you'll move faster — skim Part 0 and start at Part I. If you don't, follow the chapters in order; the pace is gentle on purpose.</p>
+      <div class="cols">
+        <div>
+          <h3>You bring</h3>
+          <ul>
+            <li>Basic SQL: <code>SELECT</code>, <code>WHERE</code>, maybe a <code>JOIN</code>.</li>
+            <li>A working terminal.</li>
+            <li>Curiosity about how databases actually work.</li>
+          </ul>
+        </div>
+        <div>
+          <h3>You'll leave with</h3>
+          <ul>
+            <li>A working mental model of MySQL internals.</li>
+            <li>The ability to read and navigate a Go codebase the size of Vitess.</li>
+            <li>A clear map of every Vitess component and what it does.</li>
+            <li>Enough context to file a real PR.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="what-this-is-not">
+      <h2>What this course is — and is not</h2>
+      <p>This course is code-focused. Every concept points at a real file. Every claim has a code path you can verify. We deliberately resist the temptation to explain Vitess only through diagrams and analogies — those help, but they're not enough to make you an effective contributor. When something is fuzzy, the cure is usually to open the file the chapter cites and stare at it for ten minutes.</p>
+      <p>This course is <em>not</em> a substitute for the official documentation at <a href="https://vitess.io/docs/" target="_blank">vitess.io/docs</a>. Those docs are operator-focused — they tell you how to run Vitess in production. This course is contributor-focused — it tells you how to change Vitess. Keep both open. They complement each other.</p>
+      <blockquote>"If you can't replicate the bug against plain MySQL, the bug probably <em>is</em> Vitess. If you can, the bug is below Vitess, and you need to know what's down there."</blockquote>
+      <p>That quote captures the whole reason Part 0 (foundations) and Part I (MySQL) come before any Vitess code. Skipping them is technically allowed; it just makes everything afterwards harder.</p>
+    </section>
+
+    <section id="pace">
+      <h2>Choose your pace</h2>
+      <p>Two schedules. Pick the one that fits your week, not the one that flatters your speed.</p>
+      <h3>7-day plan (~90 minutes/day)</h3>
+      <table class="compare">
+        <tr><th>Day</th><th>Chapters</th><th>Theme</th></tr>
+        <tr><td>1</td><td>1 – 5</td><td>Foundations: SQL, DB internals, Go primer, terminal</td></tr>
+        <tr><td>2</td><td>6 – 11</td><td>MySQL: architecture, replication, protocol, pooling</td></tr>
+        <tr><td>3</td><td>12 – 15</td><td>Build Vitess locally, learn the code map</td></tr>
+        <tr><td>4</td><td>16 – 20</td><td>vtgate: topology, lifecycle, parser, planner, engine</td></tr>
+        <tr><td>5</td><td>21 – 24</td><td>vttablet, replication management, VTOrc, mysqlctl</td></tr>
+        <tr><td>6</td><td>25 – 30</td><td>Sharding, VReplication, online DDL, throttler, backups</td></tr>
+        <tr><td>7</td><td>31 – 32</td><td>Testing &amp; your first PR</td></tr>
+      </table>
+      <h3>14-day plan (~45 minutes/day)</h3>
+      <p>Halve each day's load. Days 1-2 are foundations; 3-4 MySQL; 5-6 Vitess overview + local cluster; 7-8 vtgate; 9-10 vttablet + replication; 11-12 sharding + VReplication; 13-14 tests + PR.</p>
+      <p>Aim for half your time reading and half running the labs. Reading alone makes you feel like you understand; running the labs is how you actually do. If you can only do one, run the labs.</p>
+    </section>
+
+    <section id="chapter-template">
+      <h2>How to read a chapter</h2>
+      <p>Every chapter follows the same shape. Once you recognize it, you can decide for each section whether to skim or deep-read.</p>
+      <ol>
+        <li><strong>Hero</strong> — title, part tag, one-line framing.</li>
+        <li><strong>Objectives</strong> — a four-bullet list of what you'll be able to do by the end. Use it as a self-test.</li>
+        <li><strong>Narrative sections</strong> — each one bridges from the previous, develops one idea over a few paragraphs (with diagrams and code inline), and closes with a takeaway.</li>
+        <li><strong>Worked example</strong> — at least one detailed walked-through example so the abstractions get concrete.</li>
+        <li><strong>Lab</strong> — hands-on commands with expected output. Optional but strongly recommended.</li>
+        <li><strong>Misconceptions</strong> — the most common wrong assumptions, called out so you don't make them.</li>
+        <li><strong>Quiz</strong> — three to five questions with reveal-on-click answers. Honest self-check, not graded.</li>
+        <li><strong>Recap</strong> — the summary card. If you can't recite this, re-read the chapter.</li>
+        <li><strong>Further reading</strong> — external links and code pointers for the obsessed.</li>
+      </ol>
+      <p>You can jump to any section using the chapter Table of Contents that sits beneath the topbar in docs view.</p>
+    </section>
+
+    <section id="badges-and-callouts">
+      <h2>Badges and callouts</h2>
+      <p>Slides and sections are tagged so you know what kind of content is coming.</p>
+      <p>
+        <span class="slide-badge beginner">Beginner</span>
+        Plain-English explanation. Always safe to read.
+      </p>
+      <p>
+        <span class="slide-badge deepdive">Deep Dive</span>
+        Internals you can skip on first pass and come back to. Skipping them won't break the next chapter.
+      </p>
+      <p>
+        <span class="slide-badge lab">Lab</span>
+        Run these commands; the output should match.
+      </p>
+      <p>
+        <span class="slide-badge recap">Recap</span>
+        End-of-chapter summary or quiz.
+      </p>
+      <p>Callouts highlight specific things to notice:</p>
+      <div class="callout"><div class="callout-title">Note</div>Worth knowing — useful context.</div>
+      <div class="callout warn"><div class="callout-title">Watch out</div>A real gotcha. People make this mistake.</div>
+      <div class="callout danger"><div class="callout-title">Important</div>Don't skip; the chapter relies on this.</div>
+      <div class="callout success"><div class="callout-title">Try it</div>Hands-on action you should actually run.</div>
+      <div class="callout misc"><div class="callout-title">Common misconception</div>People often think this — they're wrong.</div>
+    </section>
+
+    <section id="glossary">
+      <h2>Use the glossary, especially early on</h2>
+      <p>Any word with a dashed underline is a <strong>glossary term</strong>. Hover or tap it for an instant definition. The glossary covers everything from foundational SQL terms to Vitess-specific concepts — about fifty terms in total. Press <kbd>g</kbd> at any time to open the full glossary drawer, which you can search.</p>
+      <p>Try it now. Hover over each of these and read the definition:</p>
+      <ul>
+        <li><span class="g" data-term="binlog">binlog</span> — the MySQL log file Vitess hooks into.</li>
+        <li><span class="g" data-term="shard">shard</span> — one slice of data.</li>
+        <li><span class="g" data-term="vindex">vindex</span> — the function that maps a row to a shard.</li>
+        <li><span class="g" data-term="vtgate">vtgate</span> — Vitess's query router.</li>
+      </ul>
+      <p>If you ever get lost on what a word means, don't read past it. Misunderstanding a key term compounds. Stop, hover, and only then continue.</p>
+    </section>
+
+    <section id="two-views">
+      <h2>Two views: docs and presentation</h2>
+      <p>By default, this site renders each chapter as a scrollable docs page — easy to read at length, easy to search, easy to skim. The Table of Contents at the top lets you jump between sections.</p>
+      <p>If you prefer slide-style reading — one idea per screen, arrow keys to navigate, full-screen mode — click the <code>◧ Slides</code> button in the top right (or press <kbd>v</kbd>). Your preference saves and persists across chapters. Switch back any time. The content is identical in both views; only the presentation differs.</p>
+      <div class="callout">
+        <div class="callout-title">When each view shines</div>
+        Docs mode is better for first-pass reading, code-along sessions, and search. Slides mode is better for review, presentations, or when you want to absorb one concept at a time without scrolling distractions.
+      </div>
+    </section>
+
+    <section id="warm-up">
+      <h2>Warm-up lab</h2>
+      <p>You don't need Vitess running yet — we'll do that in chapter 14. For now, let's just confirm your shell works and you can find the repo.</p>
+      <div class="lab">
+        <div class="lab-title">5 minutes · confirm setup</div>
+        <ol>
+          <li>Open a terminal.</li>
+          <li>Navigate to your Vitess repo: <pre><code class="language-bash">cd /path/to/vitess</code></pre></li>
+          <li>List the tutorial directory: <pre><code class="language-bash">ls kalyan_docs/</code></pre></li>
+        </ol>
+        <div class="lab-step">
+          <div class="expected-label">Expected output</div>
+<pre class="expected">README.md
+assets
+chapters
+index.html
+start.sh
+</pre>
+        </div>
+        <p>If you see those five entries, you're ready for everything that follows. If <code>ls</code> isn't a command you recognize, chapter 5 (Terminal &amp; Repo Primer) is the chapter you most want to read carefully.</p>
+      </div>
+    </section>
+
+    <section id="predict">
+      <h2>Quick check: read a SQL query</h2>
+      <p>Before chapter 2 dives into SQL formally, let's confirm where you are. Given this tiny <code>customer</code> table:</p>
+<pre><code class="language-text">customer_id | email                | country
+1           | alice@example.com    | US
+2           | bob@example.com      | IN
+3           | carol@example.com    | US</code></pre>
+      <p>What does this query return?</p>
+<pre><code class="language-sql">SELECT COUNT(*) FROM customer WHERE country = 'US';</code></pre>
+      <div class="quiz">
+        <details>
+          <summary>Reveal the answer</summary>
+          <div class="quiz-a">
+            <code>2</code> — two rows where <code>country = 'US'</code> (Alice and Carol). If you got it instantly, you're ready. If you had to think, that's fine — chapter 2 is a SQL refresher. If the question itself felt confusing, read chapter 2 carefully and try the warm-up lab at the end of it.
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section id="quiz">
+      <h2>Checkpoint quiz</h2>
+      <div class="quiz">
+        <div class="quiz-q">1. The course is structured in three layers. What are they, in order?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Foundations (SQL, DB internals, Go reading, terminal) → MySQL internals → Vitess components. Each layer builds on the one below.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">2. Which of these do you <em>not</em> need to know before starting this course?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Go, MySQL internals, distributed systems, Vitess itself. You only need basic SQL and a terminal. Everything else is taught here.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">3. What's the difference between a Beginner badge and a Deep Dive badge?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Beginner sections are essential and plain-English — always read them. Deep Dive sections are internals you can skip on first pass and revisit later; skipping won't block your understanding of the next chapter.</div></details>
+      </div>
+      <div class="quiz">
+        <div class="quiz-q">4. How do you switch between docs view and slides view?</div>
+        <details><summary>Reveal</summary><div class="quiz-a">Click the <code>◧ Slides</code> / <code>▤ Docs</code> button in the chapter's top-right corner, or press <kbd>v</kbd>. Your preference saves across chapters.</div></details>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+      <div class="recap">
+        <div class="recap-title">You should now be able to</div>
+        <ul>
+          <li>Describe the three layers of the course in one sentence.</li>
+          <li>Pick a 7-day or 14-day study plan.</li>
+          <li>Recognize the standard chapter template, badges, and callouts.</li>
+          <li>Use the glossary on any underlined term.</li>
+          <li>Toggle between docs and slides view.</li>
+          <li>Run a shell command in the Vitess repo and find the tutorial.</li>
+        </ul>
+      </div>
+      <p>Next chapter: a focused SQL refresher. We'll use a tiny e-commerce schema (customers, orders, products) you'll see again and again throughout this course — so it's worth memorizing the table names.</p>
+    </section>
+
+    <section id="further-reading">
+      <h2>Further reading</h2>
+      <ul>
+        <li><a href="https://vitess.io/docs/" target="_blank">vitess.io/docs</a> — official user-facing docs (operator-focused).</li>
+        <li><a href="https://vitess.io/contributing/" target="_blank">vitess.io/contributing</a> — community onboarding.</li>
+        <li><a href="../README.md" target="_blank">README.md</a> of this tutorial.</li>
+      </ul>
+    </section>
+  </div>
+
+  <script src="../assets/js/sidebar.js"></script>
+  <script src="../assets/js/chapter-shell.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script src="../assets/js/deck.js"></script>
+</body>
+</html>
